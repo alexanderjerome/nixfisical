@@ -1,0 +1,538 @@
+"""HTTP client for the Infisical REST API.
+
+Scope note: this covers exactly the endpoints the Ansible role used, and no
+more. Infisical's API is large and versioned inconsistently (``/api/v1``,
+``/api/v2`` and ``/api/v3`` all appear below, and that is not a typo -- it is
+what the server exposes). Keeping the surface small keeps the blast radius of
+an upstream change small.
+
+Two behaviours carried over from the role deserve explanation:
+
+* **Tolerated conflict statuses.** Several "create" endpoints are not
+  idempotent and do not agree on how to report "that already exists".
+  Environments answer 400, 409 *or* 422 depending on version; folders answer
+  400 or 409. Rather than pre-flighting with a list call for every object, we
+  create optimistically and pass the acceptable statuses in ``allow_status``.
+* **POST-then-PATCH upsert for secrets.** There is no upsert endpoint. The
+  role created and, on conflict, updated. We do the same in
+  :meth:`InfisicalClient.upsert_secret`.
+
+Nothing in this module logs or embeds a secret value. Error bodies are
+truncated and are only ever from failing calls, but note that a failing
+secret write can echo back the payload -- see ``_redact``.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Iterable, Mapping
+
+import httpx
+
+__all__ = ["InfisicalError", "InfisicalClient", "UniversalAuthCredentials"]
+
+# Trusted-IP allowlist applied to the machine identity. The Ansible role used
+# an open allowlist because the identity is reachable only over the estate's
+# private network and every consumer's egress IP is dynamic; narrowing this is
+# a follow-up that needs the network model, not a one-line change here.
+_OPEN_TRUSTED_IPS: list[dict[str, str]] = [
+    {"ipAddress": "0.0.0.0/0"},
+    {"ipAddress": "::/0"},
+]
+
+# Response bodies are only surfaced on failure, but a failed secret write can
+# reflect the submitted payload back at us. Redact the obvious carriers before
+# anything reaches an exception message.
+_SECRET_FIELD_NAMES = frozenset(
+    {
+        "secretValue",
+        "clientSecret",
+        "password",
+        "accessToken",
+        "token",
+        "privateKey",
+        "encryptedPrivateKey",
+    }
+)
+
+_BODY_TRUNCATE_AT = 600
+
+
+class InfisicalError(RuntimeError):
+    """An Infisical API call failed.
+
+    Carries the HTTP status and a truncated, redacted response body so an
+    operator can tell a 401 from a 422 without opening a proxy log.
+    """
+
+    def __init__(self, message: str, *, status: int | None = None, body: str = "") -> None:
+        self.status = status
+        self.body = body
+        detail = f" (HTTP {status})" if status is not None else ""
+        if body:
+            detail += f": {body}"
+        super().__init__(f"{message}{detail}")
+
+
+@dataclass(frozen=True)
+class UniversalAuthCredentials:
+    """The client id / client secret pair for a Universal Auth identity.
+
+    ``__repr__`` is overridden so a stray ``print`` or a traceback frame
+    rendering local variables cannot leak the secret half.
+    """
+
+    client_id: str
+    client_secret: str
+
+    def __repr__(self) -> str:  # pragma: no cover - defensive formatting
+        return f"UniversalAuthCredentials(client_id={self.client_id!r}, client_secret=<redacted>)"
+
+
+def _redact(value: Any) -> Any:
+    """Recursively blank out fields whose names imply secret material."""
+    if isinstance(value, Mapping):
+        return {
+            key: ("<redacted>" if key in _SECRET_FIELD_NAMES else _redact(item))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact(item) for item in value]
+    return value
+
+
+def _safe_body(response: httpx.Response) -> str:
+    """Render a response body for an error message: redacted and truncated.
+
+    Only structured JSON is echoed, because only there can we redact by field
+    name. A non-JSON body -- an HTML error page from a reverse proxy, say --
+    is described but never quoted: we cannot reason about what it contains,
+    and the request that produced it carried a secret value.
+    """
+    try:
+        rendered = repr(_redact(response.json()))
+    except ValueError:
+        content_type = response.headers.get("content-type", "unknown")
+        rendered = (
+            f"<non-JSON body withheld: {content_type},"
+            f" {len(response.content)} bytes>"
+        )
+    rendered = " ".join(rendered.split())
+    if len(rendered) > _BODY_TRUNCATE_AT:
+        rendered = rendered[:_BODY_TRUNCATE_AT] + "...<truncated>"
+    return rendered
+
+
+class InfisicalClient:
+    """Minimal Infisical API client.
+
+    ``token`` may be set after construction -- bootstrap creates the client
+    unauthenticated, receives a superadmin token from ``/admin/bootstrap``, and
+    then keeps using the same connection pool.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        token: str | None = None,
+        verify: bool = True,
+        timeout: float = 30.0,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.token = token
+        self.verify = verify
+        self._client = httpx.Client(
+            base_url=self.base_url,
+            verify=verify,
+            timeout=timeout,
+            follow_redirects=True,
+        )
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def close(self) -> None:
+        self._client.close()
+
+    def __enter__(self) -> "InfisicalClient":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+    # -- plumbing ----------------------------------------------------------
+
+    def _headers(self, *, authenticated: bool) -> dict[str, str]:
+        headers = {"Accept": "application/json"}
+        if authenticated:
+            if not self.token:
+                raise InfisicalError("no access token available; authenticate first")
+            headers["Authorization"] = f"Bearer {self.token}"
+        return headers
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: Mapping[str, Any] | None = None,
+        params: Mapping[str, Any] | None = None,
+        authenticated: bool = True,
+        allow_status: Iterable[int] = (),
+        description: str | None = None,
+    ) -> tuple[int, dict[str, Any]]:
+        """Issue a request and return ``(status, parsed_body)``.
+
+        Any 2xx status, plus anything in ``allow_status``, is returned to the
+        caller; everything else raises :class:`InfisicalError`. ``allow_status``
+        is how the tolerate-already-exists cases are expressed -- the caller
+        inspects the returned status to tell "created" from "existed".
+
+        A body that is not JSON parses to ``{}`` rather than raising, because
+        several Infisical endpoints answer 200 with an empty body.
+        """
+        what = description or f"{method} {path}"
+        try:
+            response = self._client.request(
+                method,
+                path,
+                json=dict(json) if json is not None else None,
+                params=dict(params) if params is not None else None,
+                headers=self._headers(authenticated=authenticated),
+            )
+        except httpx.HTTPError as exc:
+            raise InfisicalError(f"{what} failed: {exc}") from exc
+
+        allowed = set(allow_status)
+        if not (200 <= response.status_code < 300 or response.status_code in allowed):
+            raise InfisicalError(
+                what, status=response.status_code, body=_safe_body(response)
+            )
+
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {"data": payload}
+        return response.status_code, payload
+
+    # -- status ------------------------------------------------------------
+
+    def status(self) -> dict[str, Any]:
+        """Probe ``/api/status``.
+
+        Used by the ``status`` command and as a readiness gate in deploy
+        scripts: a freshly started Infisical answers this well before it is
+        ready to be bootstrapped.
+        """
+        _, payload = self._request(
+            "GET", "/api/status", authenticated=False, description="status probe"
+        )
+        return payload
+
+    # -- bootstrap & identity ---------------------------------------------
+
+    def bootstrap_instance(
+        self, *, email: str, password: str, organization: str
+    ) -> dict[str, Any]:
+        """Initialise an uninitialised instance: superadmin + organization.
+
+        This endpoint succeeds exactly once in an instance's life; a second
+        call answers an error. That one-shot nature is why bootstrap.py is so
+        careful about not calling it against an instance that may already be
+        set up.
+        """
+        _, payload = self._request(
+            "POST",
+            "/api/v1/admin/bootstrap",
+            json={
+                "email": email,
+                "password": password,
+                "organization": organization,
+            },
+            authenticated=False,
+            description="instance bootstrap",
+        )
+        return payload
+
+    def create_identity(
+        self, *, name: str, organization_id: str, role: str = "admin"
+    ) -> str:
+        """Create a machine identity in the organization; return its id."""
+        _, payload = self._request(
+            "POST",
+            "/api/v1/identities",
+            json={"name": name, "organizationId": organization_id, "role": role},
+            description=f"create identity {name!r}",
+        )
+        identity_id = payload.get("identity", {}).get("id")
+        if not identity_id:
+            raise InfisicalError(f"create identity {name!r} returned no identity id")
+        return identity_id
+
+    def attach_universal_auth(
+        self, identity_id: str, *, token_ttl: int = 2592000
+    ) -> str:
+        """Attach the Universal Auth method to an identity; return its clientId.
+
+        ``accessTokenNumUsesLimit`` is 0 (unlimited) because the sync identity
+        is used by every host on every activation; a use limit would turn a
+        busy deploy day into an outage.
+        """
+        _, payload = self._request(
+            "POST",
+            f"/api/v1/auth/universal-auth/identities/{identity_id}",
+            json={
+                "accessTokenTTL": token_ttl,
+                "accessTokenMaxTTL": token_ttl,
+                "accessTokenNumUsesLimit": 0,
+                "accessTokenTrustedIps": _OPEN_TRUSTED_IPS,
+                "clientSecretTrustedIps": _OPEN_TRUSTED_IPS,
+            },
+            description="attach universal auth",
+        )
+        client_id = payload.get("identityUniversalAuth", {}).get("clientId")
+        if not client_id:
+            raise InfisicalError("attach universal auth returned no clientId")
+        return client_id
+
+    def create_client_secret(
+        self,
+        identity_id: str,
+        *,
+        description: str = "nixfisical sync identity",
+    ) -> str:
+        """Mint a non-expiring, unlimited-use client secret for an identity.
+
+        ``ttl`` and ``numUsesLimit`` are both 0 (unlimited) for the same reason
+        as above: this credential is the estate's bootstrap-of-last-resort and
+        rotating it is a deliberate operator action, not a timer.
+        """
+        _, payload = self._request(
+            "POST",
+            f"/api/v1/auth/universal-auth/identities/{identity_id}/client-secrets",
+            json={"description": description, "numUsesLimit": 0, "ttl": 0},
+            description="mint client secret",
+        )
+        client_secret = payload.get("clientSecret")
+        if not client_secret:
+            raise InfisicalError("mint client secret returned no clientSecret")
+        return client_secret
+
+    def universal_auth_login(self, credentials: UniversalAuthCredentials) -> str:
+        """Exchange a client id/secret for an access token; also sets ``self.token``.
+
+        Doubles as the bootstrap-completeness probe: if this succeeds against
+        the credentials in the admin file, the instance is genuinely set up.
+        """
+        _, payload = self._request(
+            "POST",
+            "/api/v1/auth/universal-auth/login",
+            json={
+                "clientId": credentials.client_id,
+                "clientSecret": credentials.client_secret,
+            },
+            authenticated=False,
+            description="universal auth login",
+        )
+        token = payload.get("accessToken")
+        if not token:
+            raise InfisicalError("universal auth login returned no accessToken")
+        self.token = token
+        return token
+
+    # -- projects, environments, folders ----------------------------------
+
+    def list_projects(self, organization_id: str) -> dict[str, str]:
+        """Return a ``{project name: project id}`` map for the organization.
+
+        Infisical calls these "workspaces" at the v2 endpoint and "projects"
+        everywhere else; we speak "project" outward and translate here.
+        """
+        _, payload = self._request(
+            "GET",
+            f"/api/v2/organizations/{organization_id}/workspaces",
+            description="list projects",
+        )
+        workspaces = payload.get("workspaces") or []
+        return {
+            workspace["name"]: workspace["id"]
+            for workspace in workspaces
+            if workspace.get("name") and workspace.get("id")
+        }
+
+    def create_project(self, name: str) -> str:
+        """Create a secret-manager project; return its id."""
+        _, payload = self._request(
+            "POST",
+            "/api/v2/workspace",
+            json={"projectName": name, "type": "secret-manager"},
+            description=f"create project {name!r}",
+        )
+        project_id = payload.get("project", {}).get("id")
+        if not project_id:
+            raise InfisicalError(f"create project {name!r} returned no project id")
+        return project_id
+
+    def create_environment(self, project_id: str, *, name: str, slug: str) -> bool:
+        """Ensure an environment exists. Returns True if we created it.
+
+        400/409/422 are all tolerated: the version of Infisical decides which
+        one it uses for "already exists", and none of them are distinguishable
+        from the others without parsing prose error messages.
+        """
+        status, _ = self._request(
+            "POST",
+            f"/api/v1/workspace/{project_id}/environments",
+            json={"name": name, "slug": slug},
+            allow_status={400, 409, 422},
+            description=f"create environment {slug!r}",
+        )
+        return 200 <= status < 300
+
+    def create_folder(
+        self, *, project_id: str, environment: str, path: str, name: str
+    ) -> bool:
+        """Ensure one folder exists under ``path``. Returns True if created.
+
+        ``path`` is the *parent* directory and ``name`` is the leaf segment;
+        the API has no mkdir -p, which is why reconcile.py expands ancestors.
+        """
+        status, _ = self._request(
+            "POST",
+            "/api/v1/folders",
+            json={
+                "workspaceId": project_id,
+                "environment": environment,
+                "path": path,
+                "name": name,
+            },
+            allow_status={400, 409},
+            description=f"create folder {path.rstrip('/')}/{name}",
+        )
+        return 200 <= status < 300
+
+    # -- secrets -----------------------------------------------------------
+
+    def create_secret(
+        self,
+        name: str,
+        *,
+        project_id: str,
+        environment: str,
+        secret_path: str,
+        value: str,
+    ) -> bool:
+        """Attempt to create a secret. Returns False if it already existed.
+
+        Conflicts (400/409/422) are tolerated so :meth:`upsert_secret` can fall
+        through to a PATCH.
+        """
+        status, _ = self._request(
+            "POST",
+            f"/api/v3/secrets/raw/{name}",
+            json={
+                "workspaceId": project_id,
+                "environment": environment,
+                "secretPath": secret_path,
+                "secretValue": value,
+                "type": "shared",
+            },
+            allow_status={400, 409, 422},
+            description=f"create secret {environment}:{secret_path}:{name}",
+        )
+        return 200 <= status < 300
+
+    def update_secret(
+        self,
+        name: str,
+        *,
+        project_id: str,
+        environment: str,
+        secret_path: str,
+        value: str,
+    ) -> None:
+        """Overwrite an existing secret's value."""
+        self._request(
+            "PATCH",
+            f"/api/v3/secrets/raw/{name}",
+            json={
+                "workspaceId": project_id,
+                "environment": environment,
+                "secretPath": secret_path,
+                "secretValue": value,
+            },
+            description=f"update secret {environment}:{secret_path}:{name}",
+        )
+
+    def upsert_secret(
+        self,
+        name: str,
+        *,
+        project_id: str,
+        environment: str,
+        secret_path: str,
+        value: str,
+    ) -> str:
+        """Create-or-update a secret; return ``"created"`` or ``"updated"``.
+
+        Infisical has no upsert endpoint, so this is POST-then-PATCH-on-conflict
+        exactly as the Ansible role did it. The alternative -- list first, then
+        branch -- costs an extra round trip per secret and still races.
+        """
+        created = self.create_secret(
+            name,
+            project_id=project_id,
+            environment=environment,
+            secret_path=secret_path,
+            value=value,
+        )
+        if created:
+            return "created"
+        self.update_secret(
+            name,
+            project_id=project_id,
+            environment=environment,
+            secret_path=secret_path,
+            value=value,
+        )
+        return "updated"
+
+    def list_secrets(
+        self, *, project_id: str, environment: str, path: str = "/"
+    ) -> list[dict[str, Any]]:
+        """List secrets recursively under ``path``.
+
+        Returned dicts are the raw API objects; the reconciler reads only
+        ``secretKey`` and ``secretPath`` from them. ``secretValue`` is present
+        and must not be logged.
+        """
+        _, payload = self._request(
+            "GET",
+            "/api/v3/secrets/raw",
+            params={
+                "workspaceId": project_id,
+                "environment": environment,
+                "secretPath": path,
+                "recursive": "true",
+            },
+            description=f"list secrets {environment}:{path}",
+        )
+        secrets = payload.get("secrets") or []
+        return [secret for secret in secrets if isinstance(secret, dict)]
+
+    def delete_secret(
+        self, name: str, *, project_id: str, environment: str, secret_path: str
+    ) -> None:
+        """Delete a secret. Used only by prune."""
+        self._request(
+            "DELETE",
+            f"/api/v3/secrets/raw/{name}",
+            json={
+                "workspaceId": project_id,
+                "environment": environment,
+                "secretPath": secret_path,
+            },
+            description=f"delete secret {environment}:{secret_path}:{name}",
+        )

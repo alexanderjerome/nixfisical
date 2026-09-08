@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nixfisical"
+version = "0.1.0"
+description = "Declarative bootstrap and reconciliation for a self-hosted Infisical instance"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Alexander Jerome" }]
+keywords = ["infisical", "sops", "nixos", "secrets"]
+classifiers = [
+  "Environment :: Console",
+  "Intended Audience :: System Administrators",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: System :: Systems Administration",
+]
+dependencies = [
+  "click>=8.1",
+  "httpx>=0.27",
+  "pyyaml>=6.0",
+]
+
+[project.scripts]
+nixfisical = "nixfisical.cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["nixfisical*"]

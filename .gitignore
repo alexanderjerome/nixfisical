@@ -1,0 +1,12 @@
+result
+result-*
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.direnv/
+
+# Never commit a decrypted admin file. `nixfisical bootstrap` writes this
+# path plaintext for the moment between rendering and `sops --encrypt`, and
+# deletes it if encryption fails — this is the belt to that suspenders.
+*.yaml.plain
