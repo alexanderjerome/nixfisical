@@ -3,8 +3,8 @@
 # nixpkgs ships only the Infisical *client* (`pkgs.infisical`, the Go CLI).
 # There is no `services.infisical`, so every self-hoster ends up hand-rolling
 # an OCI container. This module is that hand-rolled container, done once and
-# declaratively — with a `native` backend behind the same option surface for
-# when the server package lands (see docs/native.md).
+# declaratively — plus a `native` backend behind the same option surface,
+# which runs a Nix-built server as an ordinary systemd unit.
 #
 # Secrets never appear in the Nix store. Anything sensitive is read at start
 # from `environmentFiles` — point those at `config.sops.templates.*.path`, an
@@ -93,6 +93,47 @@ let
     }
   );
 
+  # Shared by both native units. The server and the migrator run the same code
+  # against the same database and differ only in what they do with it, so
+  # letting their sandboxes drift would mean a migration that works and a
+  # server that does not, for reasons unrelated to either.
+  #
+  # `ProtectSystem=strict` makes the whole filesystem read-only bar the
+  # StateDirectory, which is what the store-resident server wants anyway.
+  # `@resources` is *not* in SystemCallFilter's deny list: Node adjusts its own
+  # heap and thread pool at startup and dies without it.
+  hardening = {
+    NoNewPrivileges = true;
+    ProtectSystem = "strict";
+    ProtectHome = true;
+    PrivateTmp = true;
+    PrivateDevices = true;
+    ProtectKernelTunables = true;
+    ProtectKernelModules = true;
+    ProtectKernelLogs = true;
+    ProtectControlGroups = true;
+    ProtectClock = true;
+    ProtectHostname = true;
+    ProtectProc = "invisible";
+    RestrictNamespaces = true;
+    RestrictRealtime = true;
+    RestrictSUIDSGID = true;
+    LockPersonality = true;
+    MemoryDenyWriteExecute = false; # V8 JITs; this would kill the process
+    RemoveIPC = true;
+    RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
+    SystemCallArchitectures = "native";
+    SystemCallFilter = [ "@system-service" "~@privileged" ];
+    CapabilityBoundingSet = [ "" ];
+    AmbientCapabilities = [ "" ];
+    UMask = "0077";
+  };
+
+  # `[ "" ]` — not `[ ]` — is how systemd is told to reset a capability list
+  # before adding to it; an empty list would leave whatever `hardening` set.
+  bindCapabilities =
+    if cfg.port < 1024 then [ "CAP_NET_BIND_SERVICE" ] else [ "" ];
+
   # Assembled once and shared by every backend, so `native` inherits the whole
   # option surface for free when it lands.
   serverEnvironment = {
@@ -121,9 +162,11 @@ in
         `oci` runs the upstream `infisical/infisical` container image. This is
         what upstream supports and what works today.
 
-        `native` runs a Nix-built server as a plain systemd unit, with no
-        container runtime. Not yet implemented; see docs/native.md. Selecting
-        it produces a clear evaluation error rather than a broken host.
+        `native` runs a Nix-built server (`pkgs.infisical-backend`, from this
+        flake's overlay) as a plain systemd unit, with no container runtime.
+        It splits the image's conflated entrypoint in two: `infisical.service`
+        never migrates, and `infisical-migrate.service` is the only thing that
+        does — see `database.autoMigrate`.
 
         Every option below is backend-agnostic — they describe the server's
         configuration, not how it is packaged.
@@ -132,9 +175,35 @@ in
 
     package = mkOption {
       type = types.nullOr types.package;
-      default = null;
+      # Resolves when this flake's overlay is in nixpkgs, and stays null
+      # otherwise so the assertion below can say what to do about it. Importing
+      # the module without the overlay must not be an eval error for `oci`
+      # users, who never touch this.
+      default = pkgs.infisical-backend or null;
+      defaultText = lib.literalExpression "pkgs.infisical-backend (via this flake's overlay)";
       description = ''
         Server package for the `native` backend. Ignored by `oci`.
+
+        It must provide `bin/infisical-server` and `bin/infisical-migrate`.
+        Leave it null and add this flake's overlay to get the packaged
+        upstream server; set it to pin a different build.
+      '';
+    };
+
+    user = mkOption {
+      type = types.str;
+      default = "infisical";
+      description = ''
+        Unix user the `native` server runs as. Created automatically unless it
+        already exists. Ignored by `oci`.
+      '';
+    };
+
+    group = mkOption {
+      type = types.str;
+      default = "infisical";
+      description = ''
+        Unix group for the `native` server. Ignored by `oci`.
       '';
     };
 
@@ -188,6 +257,28 @@ in
     };
 
     database = {
+      autoMigrate = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          Run Infisical's Knex migrations automatically before the server
+          starts. `native` backend only; the `oci` image always migrates on
+          start and this option cannot stop it.
+
+          The default is **false**, which is the opposite of what most services
+          do, and deliberately. Infisical's migrations are not uniformly
+          reversible — `20260107083948_remove-old-memberships`, for one, drops
+          six tables and defines `down()` as a no-op — so a migration is not
+          something to discover after a reboot has already applied it. Leaving
+          this off means an upgrade is `systemctl start infisical-migrate`,
+          run when someone is watching and after a backup — with
+          `infisical-migrate status` first to see what is pending.
+
+          Turning it on is reasonable for a machine you can lose: a test VM,
+          or an instance whose database is restored from elsewhere.
+        '';
+      };
+
       connectionUri = mkOption {
         type = types.nullOr types.str;
         default = null;
@@ -473,13 +564,34 @@ in
           message = "services.infisical: the `oci` backend needs virtualisation.oci-containers.backend set (e.g. \"docker\" or \"podman\").";
         }
         {
-          assertion = cfg.backend != "native";
+          assertion = cfg.backend == "native" -> cfg.package != null;
           message = ''
-            services.infisical.backend = "native" is not implemented yet.
+            services.infisical.backend = "native" needs `package` set.
 
-            Packaging the Infisical server (a Node/TypeScript app with a Knex
-            migration step) is tracked in docs/native.md. Use backend = "oci"
-            until it lands; every other option carries over unchanged.
+            Add this flake's overlay to your nixpkgs so `pkgs.infisical-backend`
+            exists, or set `services.infisical.package` to your own build. It
+            must provide bin/infisical-server and bin/infisical-migrate.
+          '';
+        }
+        {
+          # The module creates the user only when it is the default name, so a
+          # custom one that nothing else defines produces units that evaluate,
+          # build and deploy, then fail at start with a systemd credentials
+          # error naming a user rather than this option. Catch it at eval.
+          assertion = cfg.backend == "native"
+            -> (cfg.user == "infisical" || config.users.users ? ${cfg.user});
+          message = ''
+            services.infisical.user is "${cfg.user}", which no other module
+            defines. This module creates the user only when it is left at the
+            default "infisical"; setting your own means you own it.
+
+            Define it, for example:
+
+              users.users."${cfg.user}" = {
+                isSystemUser = true;
+                group = "${cfg.group}";
+              };
+              users.groups."${cfg.group}" = { };
           '';
         }
       ];
@@ -497,6 +609,90 @@ in
         # runtime and a host reverse proxy disagree about loopback, and means
         # `port` above is the port actually listened on.
         extraOptions = [ "--network=host" ];
+      };
+    })
+
+    (mkIf (cfg.backend == "native") {
+      # `optionalAttrs`, not `mkIf` on the value: `users.users.foo = mkIf false
+      # {...}` still names `foo` as a key, and whether that materialises a
+      # defaults-only user is a module-system subtlety rather than a promise.
+      # Not creating the attribute at all is unambiguous.
+      #
+      # Only the default names are created. A deployment that points `user` at
+      # its own account owns that account — the assertion above makes the
+      # omission an eval error rather than a unit that fails to start.
+      users.users = lib.optionalAttrs (cfg.user == "infisical") {
+        infisical = {
+          isSystemUser = true;
+          group = cfg.group;
+          description = "Infisical server";
+        };
+      };
+      users.groups = lib.optionalAttrs (cfg.group == "infisical") {
+        infisical = { };
+      };
+
+      # The migration unit exists whether or not `autoMigrate` is set. That is
+      # the point: with it off there is still one command to run, named the
+      # same on every host, rather than an operator reconstructing a knex
+      # invocation against a store path under time pressure.
+      systemd.services.infisical-migrate = {
+        description = "Infisical database migrations";
+        # Only wanted at boot when explicitly asked for. Otherwise it stays a
+        # manual `systemctl start infisical-migrate`.
+        wantedBy = lib.optional cfg.database.autoMigrate "multi-user.target";
+        before = lib.optional cfg.database.autoMigrate "infisical.service";
+        after = [ "network-online.target" ];
+        wants = [ "network-online.target" ];
+
+        environment = serverEnvironment;
+
+        serviceConfig = hardening // {
+          Type = "oneshot";
+          # Migrations must finish before the server is considered startable,
+          # so this stays RemainAfterExit=false: each run is a fresh attempt,
+          # and a failed one does not leave a unit looking satisfied.
+          RemainAfterExit = false;
+          # `latest` is the default, but spelling it out makes `systemctl cat`
+          # say what the unit does — and leaves the other subcommands visible.
+          ExecStart = "${cfg.package}/bin/infisical-migrate latest";
+          EnvironmentFile = cfg.environmentFiles;
+          User = cfg.user;
+          Group = cfg.group;
+        };
+      };
+
+      systemd.services.infisical = {
+        description = "Infisical secrets-management server";
+        wantedBy = [ "multi-user.target" ];
+        after = [ "network-online.target" ]
+          ++ lib.optional cfg.database.autoMigrate "infisical-migrate.service";
+        wants = [ "network-online.target" ];
+        # A failed migration must not leave the old server running against a
+        # half-migrated schema.
+        requires = lib.optional cfg.database.autoMigrate "infisical-migrate.service";
+
+        environment = serverEnvironment;
+
+        serviceConfig = hardening // {
+          Type = "simple";
+          ExecStart = "${cfg.package}/bin/infisical-server";
+          EnvironmentFile = cfg.environmentFiles;
+          User = cfg.user;
+          Group = cfg.group;
+          Restart = "on-failure";
+          RestartSec = "5s";
+          StateDirectory = "infisical";
+          # Only the server binds a socket, and only a port below 1024 needs
+          # the capability. Granting it unconditionally would hand it to every
+          # instance for the benefit of the rare one that fronts 443 directly.
+          # Overrides `hardening`, hence after the merge.
+          AmbientCapabilities = bindCapabilities;
+          CapabilityBoundingSet = bindCapabilities;
+          # The upstream image runs without an explicit limit; this is a floor,
+          # not a cap, and matters once connection pools and TLS sockets add up.
+          LimitNOFILE = 65536;
+        };
       };
     })
   ]);

@@ -17,7 +17,8 @@ stopped working an hour ago.
 
 **Status: experimental (v0.1.0).** The manifest and CLI are ported from a
 working Ansible role driving a production fleet. The native (non-container)
-server backend is not implemented yet — see [Roadmap](#roadmap).
+server backend builds and evaluates but has not yet been run against a live
+Postgres — see [docs/native.md](docs/native.md).
 
 ## The idea
 
@@ -213,8 +214,48 @@ The module refuses to evaluate with an empty `environmentFiles` rather than
 booting an instance with a default encryption key. Nothing secret is ever
 written to the Nix store; `extraEnvironment` is for non-secret values only.
 
-Every option is backend-agnostic: they describe the server's configuration, not
-how it is packaged, so they carry over unchanged when `native` lands.
+### The `native` backend
+
+Every option above is backend-agnostic — they describe the server's
+configuration, not how it is packaged — so swapping the container for a plain
+systemd unit is one line plus the overlay:
+
+```nix
+{
+  nixpkgs.overlays = [ nixfisical.overlays.default ];
+
+  services.infisical = {
+    backend = "native";                  # was "oci"
+    # imageTag and virtualisation.oci-containers.backend become unused
+    # ... everything else unchanged ...
+  };
+}
+```
+
+That builds Infisical from source at a rev pinned in this flake, and splits the
+image's conflated entrypoint in two:
+
+| Unit                        | Does                                |
+| --------------------------- | ----------------------------------- |
+| `infisical.service`         | runs the API. Never migrates.       |
+| `infisical-migrate.service` | runs migrations. Nothing else does. |
+
+`database.autoMigrate` defaults to **false**, the opposite of the usual NixOS
+default. Infisical's migrations are not uniformly reversible — one of them
+drops six tables and defines `down()` as a no-op — so an upgrade should be a
+deliberate act, not something a reboot does:
+
+```sh
+infisical-migrate status          # what is pending
+systemctl start infisical-migrate # after a backup
+systemctl restart infisical
+```
+
+Bump the pinned release with `nix run .#bump-infisical -- 0.166.0`.
+
+[docs/native.md](docs/native.md) has the packaging details, including why
+upstream's `migration:latest` is three steps rather than the one
+`knex migrate:latest` you would expect.
 
 **Option namespace.** This module claims `services.infisical`. If you also
 import [`connerohnesorge/infisical-flake`](https://github.com/connerohnesorge/infisical-flake),
@@ -291,20 +332,18 @@ every grant it would make, and writes nothing.
 
 **Folder pruning.** Secrets are pruned; empty folders are left behind.
 
-**Native server backend.** See below.
+**The Infisical frontend.** The `native` backend packages the API only. The web
+UI is a separate `buildNpmPackage`; run it from the container if you need it.
 
 ## Roadmap
 
-- `services.infisical.backend = "native"` — run the server as a plain systemd
-  unit with no container runtime, so the version is pinned by the flake and
-  Knex migrations stop being something a reboot can trigger. Selecting it
-  today is a clear evaluation error, not a broken host.
-  [docs/native.md](docs/native.md) has the plan and the one command that
-  vendors upstream to work against.
 - Reporting group access that exists on the instance but is not in the
   manifest. `sync-access` never revokes, so drift in that direction is
   currently invisible.
-- A NixOS VM test covering bootstrap → sync → prune end to end.
+- A NixOS VM test covering bootstrap → sync → prune end to end, and one
+  covering the `native` units against a live Postgres — they are currently
+  verified by evaluation only.
+- Packaging the frontend, so `native` can serve the web UI too.
 
 ## Prior art
 
@@ -312,8 +351,8 @@ every grant it would make, and writes nothing.
 packages the Infisical backend and frontend with `buildNpmPackage` and exposes
 a `services.infisical` module plus cluster/backup/monitoring modules. It has no
 bootstrap or secret-sync layer — which is most of what this repo is — but it
-went further on the packaging question and is worth reading before attempting
-the native backend here.
+had already answered the packaging question, and was worth reading closely
+before the `native` backend here was written.
 
 Read it, do not depend on it. Checked 2026-09-09: last modified 2025-10-08,
 nixpkgs pinned to 2025-08-06, and it no longer evaluates —

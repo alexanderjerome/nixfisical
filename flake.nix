@@ -27,6 +27,10 @@
 
       overlays.default = final: prev: {
         nixfisical = final.callPackage ./nix/pkgs/nixfisical.nix { };
+        infisical-backend = final.callPackage ./nix/pkgs/infisical-backend.nix { };
+        # `bump-infisical` is deliberately absent: it rewrites this repo's own
+        # source and is only meaningful from a checkout, so it is a flake app
+        # rather than something a consumer's nixpkgs should carry.
       };
 
       # Render a fleet's manifest as a flake app:
@@ -80,16 +84,24 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
         nixfisical = pkgs.callPackage ./nix/pkgs/nixfisical.nix { };
+        infisical-backend = pkgs.callPackage ./nix/pkgs/infisical-backend.nix { };
+        bump-infisical = pkgs.callPackage ./nix/pkgs/bump-infisical.nix { };
       in
       {
         packages = {
-          inherit nixfisical;
+          inherit nixfisical infisical-backend bump-infisical;
           default = nixfisical;
         };
 
         apps.default = {
           type = "app";
           program = "${nixfisical}/bin/nixfisical";
+        };
+
+        apps.bump-infisical = {
+          type = "app";
+          program = "${bump-infisical}/bin/bump-infisical";
+          meta.description = "Bump the pinned Infisical release and its hashes";
         };
 
         devShells.default = pkgs.mkShell {
@@ -199,11 +211,12 @@
             in
             if actual == expected
             then "echo ok > $out"
-            else throw ''
-              nixfisical manifest check failed.
-                expected: ${expected}
-                actual:   ${actual}
-            ''
+            else
+              throw ''
+                nixfisical manifest check failed.
+                  expected: ${expected}
+                  actual:   ${actual}
+              ''
           );
         };
 
