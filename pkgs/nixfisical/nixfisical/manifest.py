@@ -99,7 +99,10 @@ def load(source: str | Path) -> list[dict[str, Any]]:
 
 
 def validate(
-    manifest: Iterable[dict[str, Any]], *, default_secrets_file: str | Path | None = None
+    manifest: Iterable[dict[str, Any]],
+    *,
+    default_secrets_file: str | Path | None = None,
+    require_sops_file: bool = True,
 ) -> list[str]:
     """Return a list of human-readable problems; empty means the manifest is fine.
 
@@ -107,6 +110,12 @@ def validate(
     set, entries without their own ``sopsFile`` are acceptable. When it is not,
     a missing ``sopsFile`` is a hard error naming the offending ``sopsKey`` --
     the operator needs to know *which* secret has nowhere to be read from.
+
+    ``require_sops_file=False`` drops that one check. It exists for
+    ``sync-access``, which reads only ``project`` and ``groups`` and never
+    opens a SOPS file: refusing to reconcile access because a secret has
+    nowhere to be *read* from would be an unrelated complaint. Every other
+    check still runs.
     """
     problems: list[str] = []
     seen: dict[tuple[str, str, str, str], int] = {}
@@ -138,7 +147,7 @@ def validate(
         sops_file = entry.get("sopsFile")
         if sops_file is not None and (not isinstance(sops_file, str) or not sops_file.strip()):
             problems.append(f"{label}: sopsFile must be a non-empty string when present")
-        elif sops_file is None and default_secrets_file is None:
+        elif sops_file is None and default_secrets_file is None and require_sops_file:
             sops_key = entry.get("sopsKey", "<unknown>")
             problems.append(
                 f"{label}: no sopsFile and no --secrets-file default; "

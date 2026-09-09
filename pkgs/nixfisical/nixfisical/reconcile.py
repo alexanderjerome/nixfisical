@@ -379,13 +379,12 @@ def reconcile(
                 summary.secrets_pruned += 1
                 summary.record("prune", target, "deleted", "not in manifest")
 
-    # TODO(access): the Ansible role also reconciled group and host access to
-    # each secret, and it did so by writing directly to Infisical's Postgres
-    # (there was no supported API for project-group membership at the time).
-    # That is out of scope for v0 and deliberately NOT ported: direct database
-    # writes against a running Infisical are unversioned, unauthenticated by
-    # the application's own rules, and silently break on upstream schema
-    # changes. The manifest's `groups` and `hosts` fields are carried through
-    # and reported so the data is ready when a supported API exists.
+    # Group access is deliberately not reconciled here: it needs different
+    # credentials (and, to create a group at all, a database connection), it
+    # fails for entirely unrelated reasons, and a `sync` that could not write
+    # secrets because a group was missing would be the wrong coupling. See
+    # `nixfisical sync-access` and ``access.py``. `groups_seen` above is
+    # collected so a plain `sync` still says which groups are outstanding;
+    # `hosts` is carried through the manifest and used by nothing yet.
 
     return summary

@@ -47,6 +47,7 @@ __all__ = [
     "bootstrap",
     "read_sync_credentials",
     "read_organization_id",
+    "split_file_key",
     "DEFAULT_COMMIT_MESSAGE",
 ]
 
@@ -151,7 +152,7 @@ def _verify_existing(
 # --------------------------------------------------------------------------
 
 
-def _split_file_key(spec: str, default_file: Path | None, *, what: str) -> tuple[Path, str]:
+def split_file_key(spec: str, default_file: Path | None, *, what: str) -> tuple[Path, str]:
     """Parse a ``FILE:KEY`` or bare ``KEY`` credential reference.
 
     A bare key resolves against ``default_file`` (the ``--secrets-file``
@@ -194,7 +195,7 @@ def resolve_admin_credentials(
     if email:
         resolved_email = email
     elif email_ref:
-        file, key = _split_file_key(email_ref, secrets_file, what="--admin-email-from")
+        file, key = split_file_key(email_ref, secrets_file, what="--admin-email-from")
         resolved_email = extract(file, sops_key_expr(key))
     else:
         raise BootstrapError(
@@ -202,7 +203,7 @@ def resolve_admin_credentials(
         )
 
     if password_ref:
-        file, key = _split_file_key(
+        file, key = split_file_key(
             password_ref, secrets_file, what="--admin-password-from"
         )
         return AdminCredentials(

@@ -223,10 +223,11 @@ which claims the same path, the two will conflict — pick one.
 ## The CLI
 
 ```
-nixfisical bootstrap   initialise a fresh instance, record creds in SOPS
-nixfisical sync        converge the instance onto a manifest
-nixfisical validate    check a manifest offline (exit 2 on problems)
-nixfisical status      is it reachable, and does the sync identity still work
+nixfisical bootstrap     initialise a fresh instance, record creds in SOPS
+nixfisical sync          converge the instance onto a manifest
+nixfisical sync-access   grant manifest groups access to their projects
+nixfisical validate      check a manifest offline (exit 2 on problems)
+nixfisical status        is it reachable, and does the sync identity still work
 ```
 
 Bootstrap is the destructive one, so it is guarded properly. If the admin file
@@ -242,15 +243,51 @@ propagates.
 first-deploy run leaves the credentials tracked rather than sitting untracked
 in a working tree waiting to be lost.
 
-## What it does not do yet
+### Group access
 
-**Access reconciliation.** The Ansible role this is ported from also created
-groups and granted them per-project roles. On Infisical's free tier the group
-API is plan-gated, so it did that with direct `INSERT`s into the Infisical
-Postgres database. That is deliberately not ported — it is a workaround
-against an undocumented schema, and it belongs behind a flag with its own
-warning if it comes back. Today `groups` is carried through the manifest and
-used for reporting only.
+`sync-access` reads the same manifest as `sync` and grants each `groups` entry
+access to the projects it appears in. It is a separate command on purpose: it
+needs different credentials, it fails for entirely unrelated reasons, and a
+`sync` that refused to write secrets because a group was missing would be the
+wrong coupling.
+
+Access is granted at the **project** level. A group named on any entry of a
+project gets the whole project, so `project` is the access boundary the
+manifest actually expresses — `environment` and `folder` do not narrow it.
+Access is never revoked; remove it in the UI.
+
+Two mechanisms, and the split matters:
+
+- **Adding an existing group to a project** is a supported, ungated API call.
+  This runs by default and needs nothing but the sync identity.
+- **Creating a group** is gated behind an enterprise plan. Upstream's
+  `getDefaultOnPremFeatures()` sets `groups: false`, and the create endpoint
+  answers `400 plan restriction`.
+
+So `--create-missing-groups` writes to Infisical's Postgres directly. It is off
+by default, prints a warning when set, and is the only operation in this tool
+that touches the database. Point it at the database with `--db-host` and give
+it a password via `--db-password-from FILE:KEY` (SOPS) or `$PGPASSWORD`.
+
+The load-bearing asymmetry that makes this safe rather than merely expedient:
+upstream gates group *mutation*, but not permission *evaluation*. A group
+created this way is honoured by the permission service exactly like any other
+— `permission-service.ts` contains no license check. This is not forging an
+entitlement, it is writing the rows the UI would have written.
+
+Because it is raw SQL against a schema with no compatibility promise, it
+refuses to run on a schema it does not recognise rather than corrupting one.
+A preflight checks every column it writes and aborts if any pre-`v0.165.8`
+membership table is still present — the schema was consolidated into
+`memberships`/`membership_roles` by migration
+`20260107083948_remove-old-memberships`, whose `down()` is a no-op. The schema
+it is verified against is recorded in `access.py` as
+`SCHEMA_VERIFIED_AGAINST`.
+
+Run it with `--dry-run` first; it reports every group it would create and
+every grant it would make, and writes nothing.
+
+## What it does not do yet
 
 **Folder pruning.** Secrets are pruned; empty folders are left behind.
 
@@ -264,7 +301,9 @@ used for reporting only.
   today is a clear evaluation error, not a broken host.
   [docs/native.md](docs/native.md) has the plan and the one command that
   vendors upstream to work against.
-- Access reconciliation behind an explicit flag.
+- Reporting group access that exists on the instance but is not in the
+  manifest. `sync-access` never revokes, so drift in that direction is
+  currently invisible.
 - A NixOS VM test covering bootstrap → sync → prune end to end.
 
 ## Prior art

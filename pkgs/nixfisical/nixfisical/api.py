@@ -536,3 +536,77 @@ class InfisicalClient:
             },
             description=f"delete secret {environment}:{secret_path}:{name}",
         )
+
+    # -- groups ------------------------------------------------------------
+    #
+    # Only the three calls ``sync-access`` needs, all of them on the current
+    # (non-deprecated) membership routes. Deliberately absent: group creation.
+    # It exists at POST /api/v1/organization/groups and answers 400 "plan
+    # restriction" on every unlicensed self-hosted instance, so exposing it
+    # here would only produce a confusing error at a distance; see
+    # ``access.Database.create_group`` for what is done instead.
+
+    def list_organization_groups(self) -> dict[str, str]:
+        """Return ``{group name: id}`` for the token's organization.
+
+        Slugs are included as additional keys so a caller can look a group up
+        by either. Listing is not plan-gated -- only mutation is.
+        """
+        _, payload = self._request(
+            "GET",
+            "/api/v1/organizations/memberships/groups",
+            params={"limit": 100},
+            description="list organization groups",
+        )
+        found: dict[str, str] = {}
+        for membership in payload.get("groupMemberships") or []:
+            if not isinstance(membership, dict):
+                continue
+            group = membership.get("group") or {}
+            group_id = group.get("id") or membership.get("groupId")
+            if not group_id:
+                continue
+            for key in (group.get("name"), group.get("slug")):
+                if key:
+                    found[key] = group_id
+        return found
+
+    def list_project_groups(self, project_id: str) -> dict[str, str]:
+        """Return ``{group id: role}`` for the groups already on a project.
+
+        The role reported is the first permanent one; a group with several
+        roles is something a human configured and this tool does not touch.
+        """
+        _, payload = self._request(
+            "GET",
+            f"/api/v1/projects/{project_id}/memberships/groups",
+            description="list project groups",
+        )
+        found: dict[str, str] = {}
+        for membership in payload.get("groupMemberships") or []:
+            if not isinstance(membership, dict):
+                continue
+            group_id = membership.get("groupId") or (membership.get("group") or {}).get("id")
+            if not group_id:
+                continue
+            roles = [
+                role.get("role")
+                for role in membership.get("roles") or []
+                if isinstance(role, dict) and role.get("role")
+            ]
+            found[group_id] = roles[0] if roles else "?"
+        return found
+
+    def add_group_to_project(self, *, project_id: str, group_id: str, role: str) -> None:
+        """Grant a group a role on a project.
+
+        Not plan-gated: upstream checks the license when a group is created or
+        edited, and when a *custom* role is assigned, but not for attaching an
+        existing group to a project with a built-in role.
+        """
+        self._request(
+            "POST",
+            f"/api/v1/projects/{project_id}/memberships/groups/{group_id}",
+            json={"roles": [{"role": role, "isTemporary": False}]},
+            description=f"add group to project with role {role!r}",
+        )

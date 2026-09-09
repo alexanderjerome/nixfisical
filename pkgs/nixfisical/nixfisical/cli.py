@@ -27,6 +27,14 @@ from typing import Any
 import click
 
 from nixfisical import __version__
+from nixfisical.access import (
+    DEFAULT_ORG_ROLE,
+    DEFAULT_PROJECT_ROLE,
+    SCHEMA_VERIFIED_AGAINST,
+    AccessError,
+    database_from_env,
+    sync_access as run_sync_access,
+)
 from nixfisical.api import InfisicalClient, InfisicalError
 from nixfisical.bootstrap import (
     DEFAULT_COMMIT_MESSAGE,
@@ -34,11 +42,12 @@ from nixfisical.bootstrap import (
     bootstrap as run_bootstrap,
     read_organization_id,
     read_sync_credentials,
+    split_file_key,
 )
 from nixfisical.manifest import load as load_manifest
 from nixfisical.manifest import resolve_paths, validate as validate_manifest
 from nixfisical.reconcile import reconcile as run_reconcile
-from nixfisical.sops import SopsError
+from nixfisical.sops import SopsError, extract, sops_key_expr
 
 EXIT_OK = 0
 EXIT_RUNTIME = 1
@@ -51,6 +60,12 @@ def _fail(message: str, code: int = EXIT_RUNTIME) -> None:
     """Print an error to stderr and exit with the contractual code."""
     click.secho(f"error: {message}", fg="red", err=True)
     sys.exit(code)
+
+
+def _read_sops_ref(spec: str, secrets_file: Path | None, *, what: str) -> str:
+    """Resolve a ``FILE:KEY`` or bare-``KEY`` option into a decrypted value."""
+    file, key = split_file_key(spec, secrets_file, what=what)
+    return extract(file, sops_key_expr(key))
 
 
 def _client(ctx: click.Context) -> InfisicalClient:
@@ -344,7 +359,168 @@ def sync_command(
 
     if summary.groups_seen:
         click.echo(f"  groups referenced by the manifest: {', '.join(summary.groups_seen)}")
-        click.echo("  (group access reconciliation is out of scope for v0)")
+        click.echo("  run 'nixfisical sync-access' to grant them project access")
+
+    click.secho(
+        ("DRY RUN " if dry_run else "") + summary.headline(),
+        fg="yellow" if dry_run else ("green" if summary.ok else "red"),
+    )
+    if not summary.ok:
+        sys.exit(EXIT_RUNTIME)
+
+
+# --------------------------------------------------------------------------
+# sync-access
+# --------------------------------------------------------------------------
+
+
+@cli.command("sync-access")
+@click.option(
+    "--manifest",
+    "manifest_source",
+    default="-",
+    show_default=True,
+    help="Path to the JSON manifest, or '-' for stdin.",
+)
+@click.option(
+    "--role",
+    "project_role",
+    default=DEFAULT_PROJECT_ROLE,
+    show_default=True,
+    help="Project role granted to each group. A built-in role: admin, member, "
+    "viewer or no-access. Custom roles need an enterprise license.",
+)
+@click.option(
+    "--org-role",
+    default=DEFAULT_ORG_ROLE,
+    show_default=True,
+    help="Organization role recorded for groups this creates. Only used with "
+    "--create-missing-groups.",
+)
+@click.option(
+    "--create-missing-groups",
+    is_flag=True,
+    default=False,
+    help="Create absent groups by writing to Infisical's Postgres directly, "
+    "bypassing the plan restriction that blocks the API. Off by default; "
+    "read the warning it prints.",
+)
+@click.option("--db-host", default=None, help="Infisical's Postgres host.")
+@click.option("--db-port", default=5432, show_default=True, type=int)
+@click.option("--db-user", default="infisical", show_default=True)
+@click.option("--db-name", default="infisical", show_default=True)
+@click.option(
+    "--db-password-from",
+    default=None,
+    metavar="FILE:KEY|KEY",
+    help="Read the Postgres password from SOPS. Falls back to $PGPASSWORD.",
+)
+@click.option(
+    "--secrets-file",
+    default=None,
+    type=click.Path(path_type=Path),
+    help="Default SOPS file for the bare-KEY form of --db-password-from.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Report what would change and write nothing.",
+)
+@click.pass_context
+def sync_access_command(
+    ctx: click.Context,
+    manifest_source: str,
+    project_role: str,
+    org_role: str,
+    create_missing_groups: bool,
+    db_host: str | None,
+    db_port: int,
+    db_user: str,
+    db_name: str,
+    db_password_from: str | None,
+    secrets_file: Path | None,
+    dry_run: bool,
+) -> None:
+    """Grant each manifest group read access to the projects it appears in.
+
+    Access is granted at the project level -- a group named on any entry of a
+    project gets the whole project -- so the manifest's 'project' field is the
+    access boundary. Access is never revoked; remove it in the UI.
+
+    Adding an existing group to a project uses the supported API. Creating a
+    group does not: Infisical gates that behind an enterprise plan, so
+    --create-missing-groups writes to its database directly.
+    """
+    admin_file: Path = ctx.obj["admin_file"]
+
+    try:
+        manifest = load_manifest(manifest_source)
+    except ValueError as exc:
+        _fail(str(exc), EXIT_VALIDATION)
+        return
+
+    problems = validate_manifest(manifest, require_sops_file=False)
+    if problems:
+        click.secho(f"manifest has {len(problems)} problem(s):", fg="red", err=True)
+        for problem in problems:
+            click.echo(f"  - {problem}", err=True)
+        sys.exit(EXIT_VALIDATION)
+
+    database = None
+    if create_missing_groups:
+        click.secho(
+            "  ! --create-missing-groups writes to Infisical's database behind "
+            "its API.",
+            fg="yellow",
+            err=True,
+        )
+        click.secho(
+            "    Upstream refuses group creation without an enterprise license, "
+            f"and this SQL was read off {SCHEMA_VERIFIED_AGAINST}; a schema "
+            "change makes it refuse, not guess. Back the database up first.",
+            fg="yellow",
+            err=True,
+        )
+        try:
+            password = (
+                _read_sops_ref(
+                    db_password_from, secrets_file, what="--db-password-from"
+                )
+                if db_password_from
+                else None
+            )
+            database = database_from_env(
+                host=db_host,
+                port=db_port,
+                user=db_user,
+                dbname=db_name,
+                password=password,
+            )
+        except (AccessError, BootstrapError, SopsError) as exc:
+            _fail(str(exc), EXIT_VALIDATION)
+            return
+
+    with _client(ctx) as client:
+        try:
+            organization_id = read_organization_id(admin_file)
+            client.universal_auth_login(read_sync_credentials(admin_file))
+        except (SopsError, InfisicalError) as exc:
+            _fail(f"could not authenticate with {admin_file}: {exc}")
+            return
+
+        summary = run_sync_access(
+            client,
+            manifest,
+            organization_id=organization_id,
+            project_role=project_role,
+            org_role=org_role,
+            database=database,
+            dry_run=dry_run,
+        )
+
+    for action in summary.actions:
+        click.echo(f"  {action.render()}")
 
     click.secho(
         ("DRY RUN " if dry_run else "") + summary.headline(),
