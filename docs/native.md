@@ -21,10 +21,15 @@ deliberate act with a diff attached.
 ## What upstream actually is
 
 Infisical's server is a Node/TypeScript application in the `backend/`
-directory of [`Infisical/infisical`](https://github.com/Infisical/infisical),
-released under tags shaped `infisical-core/v<version>`. A separate
-React/Next.js frontend lives in `frontend/`. Migrations are Knex, invoked as
-`npx knex migrate:latest --knexfile ./dist/db/knexfile.mjs` after the build.
+directory of [`Infisical/infisical`](https://github.com/Infisical/infisical).
+A separate React/Next.js frontend lives in `frontend/`. Migrations are Knex,
+invoked as `npx knex migrate:latest --knexfile ./dist/db/knexfile.mjs` after
+the build.
+
+Releases are tagged `v<version>` — `v0.165.8` at the time of writing
+(2026-09-09). The older `infisical-core/v<version>` scheme is **gone**: the
+repo has no `refs/tags/infisical-core/*` left, so any command written against
+it fails rather than resolving to something stale.
 
 To work on the packaging you want the actual source tree in front of you.
 Vendor it as a **shallow submodule, for engineering reference only** — nothing
@@ -36,8 +41,8 @@ in the flake builds from it, and nothing ever should: a real package must
 git submodule add --depth 1 \
   https://github.com/Infisical/infisical.git vendor/infisical
 git config -f .gitmodules submodule.vendor/infisical.shallow true
-git -C vendor/infisical fetch --depth 1 origin tag infisical-core/v0.97.4
-git -C vendor/infisical checkout infisical-core/v0.97.4
+git -C vendor/infisical fetch --depth 1 origin tag v0.165.8
+git -C vendor/infisical checkout v0.165.8
 
 # drop it once the package lands — it is scaffolding, not a dependency
 git rm vendor/infisical
@@ -49,7 +54,7 @@ when you add it. Keep it out of `nix/` so it is obvious it is not built.
 ## The shape of the work
 
 1. **Package the backend.** `buildNpmPackage` with an `npmDepsHash`, sources
-   pinned to `infisical-core/v<version>`, `sourceRoot` at `backend/`. Native
+   pinned to `v<version>`, `sourceRoot` at `backend/`. Native
    build inputs include python3, gcc/make, and FreeTDS for the ODBC driver
    support in Infisical's dependency tree.
 2. **Split the migration out.** Expose `infisical-migrate` as its own
@@ -65,19 +70,39 @@ when you add it. Keep it out of `nix/` so it is obvious it is not built.
    `environmentFiles` option the `oci` backend already uses — the option
    surface should not change when the backend does.
 5. **A hash-bump script**, because `npmDepsHash` cannot be computed lazily:
-   `nix-prefetch-github Infisical infisical --rev infisical-core/v<version>`,
-   then `npm ci` in a checkout to compute the deps hash.
+   `nix-prefetch-github Infisical infisical --rev v<version>`, then `npm ci` in
+   a checkout to compute the deps hash.
 
-## Read this first
+Note that steps 1–5 are all that `native` needs. The *option surface* is
+already done and is deliberately backend-agnostic: `database.*`, `redis.*`,
+`smtp.*`, `environmentFiles` and the rest describe the server's configuration
+rather than its packaging, so they carry over unchanged. `native` has to
+produce a unit that consumes them, not a second set of options.
+
+## Prior art: read it, do not depend on it
 
 [`connerohnesorge/infisical-flake`](https://github.com/connerohnesorge/infisical-flake)
-(MIT) has already done steps 1, 3 and 4 — `infisical-backend`,
-`infisical-frontend`, a `services.infisical` module with systemd hardening, and
-an `update-hashes.sh`. It is early (a handful of commits, pinned to
-`infisical-core/v0.97.4`) and has no bootstrap or sync layer, but it is a much
-better starting point than a blank file. Depending on how it holds up, the
-right answer here may be to consume it as a flake input for the package and
-keep this repo focused on the bootstrap/reconcile layer that it lacks —
-rather than maintaining a second copy of the same `buildNpmPackage`.
+(MIT) has already done steps 1, 3 and 4 — a `backend` and `frontend` package, a
+`services.infisical` module with systemd hardening, and an `update-hashes.sh`.
+It is a much better starting point than a blank file, and worth reading closely
+before writing any packaging code.
 
-That decision should be made before writing any packaging code.
+**The consume-vs-package question is settled: package it here.** Checked
+2026-09-09:
+
+- Last modified 2025-10-08 — eleven months stale — with nixpkgs pinned to
+  2025-08-06.
+- It no longer evaluates. `nix eval
+  github:connerohnesorge/infisical-flake#packages.x86_64-linux.backend.version`
+  fails with `lib.customisation.callPackageWith: Function called without
+  required argument "knex-cli"`. So it is not merely behind; it is broken
+  against current nixpkgs.
+- It is pinned to the retired `infisical-core/*` tag scheme, roughly 68 minor
+  versions behind `v0.165.8`.
+- It claims the same `services.infisical` option path this module does, so it
+  could not be imported alongside this repo's module anyway.
+
+Taking it as a flake input would mean inheriting a dead dependency on the
+critical path of every consumer. Lift the approach — the `buildNpmPackage`
+shape, the FreeTDS/python3 build inputs, the hardening — and keep the
+maintenance here.

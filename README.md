@@ -130,30 +130,91 @@ packages.${system}.infisical-manifest = nixfisical.mkManifestApp {
   virtualisation.oci-containers.backend = "docker";
 
   services.infisical = {
-    enable    = true;
-    siteUrl   = "https://infisical.example.com";
-    imageTag  = "v0.97.4-postgres";      # pin it; migrations run on start
-    redis.url = "redis://10.0.0.10:6379";
+    enable   = true;
+    siteUrl  = "https://infisical.example.com";
+    imageTag = "v0.165.8";               # pin it; migrations run on start
 
-    # ENCRYPTION_KEY, AUTH_SECRET and DB_CONNECTION_URI live here.
+    database = {
+      host = "10.0.0.11";
+      user = "infisical";
+      name = "infisical";
+    };
+    redis.host = "10.0.0.10";
+
+    smtp = {
+      enable      = true;
+      host        = "smtp.example.com";
+      username    = "no-reply@example.com";
+      fromAddress = "no-reply@example.com";
+    };
+
+    # Only the secrets live here now: see the table below.
     environmentFiles = [ config.sops.templates."infisical-env".path ];
   };
 
   sops.templates."infisical-env".content = ''
     ENCRYPTION_KEY=${config.sops.placeholder."services/infisical/encryption_key"}
     AUTH_SECRET=${config.sops.placeholder."services/infisical/auth_secret"}
-    DB_CONNECTION_URI=postgresql://infisical:${config.sops.placeholder."dbs/infisical/password"}@10.0.0.11:5432/infisical
+    DB_PASSWORD=${config.sops.placeholder."dbs/infisical/password"}
+    SMTP_PASSWORD=${config.sops.placeholder."services/infisical/smtp_password"}
   '';
 }
 ```
 
-Postgres and Redis are yours to provide — the module does not manage them, on
-purpose: in a fleet they usually live on separate hosts with their own backup
-and blast-radius story.
+Postgres and Valkey/Redis are yours to provide — the module does not manage
+them, on purpose: in a fleet they usually live on separate hosts with their own
+backup and blast-radius story. What the module does give you is the full
+configuration surface for reaching them, so the only thing left in your sops
+template is the credentials themselves.
+
+### Which settings are options, and which are secrets
+
+Infisical accepts the database connection either as one `DB_CONNECTION_URI` or
+as discrete `DB_HOST`/`DB_PORT`/`DB_USER`/`DB_NAME`/`DB_PASSWORD` variables
+(the URI wins when both are set, so the module refuses to evaluate if you
+configure both). Discrete is the default here for one reason: a connection URI
+embeds the password, so it can only ever come from an env file, while
+host/port/user/name are not secret and belong in configuration you can read and
+review.
+
+| Secret — `environmentFiles` only | Option — safe in the store |
+| -------------------------------- | -------------------------- |
+| `ENCRYPTION_KEY`, `AUTH_SECRET`  | `siteUrl`, `host`, `port`  |
+| `DB_PASSWORD`                    | `database.{host,port,user,name}` |
+| `REDIS_PASSWORD`                 | `redis.{host,port,username}`, `database.rootCert` |
+| `SMTP_PASSWORD`                  | `smtp.{host,port,username,fromAddress,…}` |
+| `DB_READ_REPLICAS` (JSON of URIs)| `database.{poolMin,poolMax}` |
+
+**Every option above defaults to null, and the module emits a variable only
+when you set the matching option.** That is deliberate. For the `oci` backend
+the options become `-e KEY=value` while `environmentFiles` becomes
+`--env-file`, and Docker and Podman resolve `-e` *ahead of* `--env-file`. If
+the module emitted defaults, an env file supplying the same key would be read
+and silently ignored. Leaving an option null keeps the variable out of the
+store entirely, so a fleet that treats (say) `SMTP_HOST` as sensitive can still
+supply it from sops. The same rule applies to `extraEnvironment`.
+
+Settings the module does not model as options — Redis Sentinel and Cluster
+topologies, queue worker profiles, SSO — go through `extraEnvironment`.
+
+### Do not use the `latest-postgres` tag
+
+Infisical's older self-hosting docs recommend `infisical/infisical:latest-postgres`,
+and it is a common default in hand-rolled deployments. It is a trap now. The
+`-postgres` suffix dates from when Infisical also shipped a MongoDB variant;
+upstream stopped publishing it. The tag still resolves, so nothing fails — but
+it has not been rebuilt since **2025-08-08**, while `latest` rebuilt yesterday.
+It is a silently frozen year-old image, not a moving pointer, and no
+`-postgres` tag appears in the most recent 100 tags (checked 2026-09-09). If
+you have a deployment on `latest-postgres`, it is a year behind and does not
+look it. Pin `v0.165.8` or similar instead.
 
 The module refuses to evaluate with an empty `environmentFiles` rather than
 booting an instance with a default encryption key. Nothing secret is ever
 written to the Nix store; `extraEnvironment` is for non-secret values only.
+
+Every option is backend-agnostic: they describe the server's configuration, not
+how it is packaged, so they carry over unchanged when `native` lands.
 
 **Option namespace.** This module claims `services.infisical`. If you also
 import [`connerohnesorge/infisical-flake`](https://github.com/connerohnesorge/infisical-flake),
@@ -211,9 +272,15 @@ used for reporting only.
 [`connerohnesorge/infisical-flake`](https://github.com/connerohnesorge/infisical-flake)
 packages the Infisical backend and frontend with `buildNpmPackage` and exposes
 a `services.infisical` module plus cluster/backup/monitoring modules. It has no
-bootstrap or secret-sync layer — which is most of what this repo is — but it is
-well ahead on the packaging question and is worth reading before attempting the
-native backend here.
+bootstrap or secret-sync layer — which is most of what this repo is — but it
+went further on the packaging question and is worth reading before attempting
+the native backend here.
+
+Read it, do not depend on it. Checked 2026-09-09: last modified 2025-10-08,
+nixpkgs pinned to 2025-08-06, and it no longer evaluates —
+`packages.x86_64-linux.backend` fails with `callPackageWith: Function called
+without required argument "knex-cli"`. It also claims the same
+`services.infisical` option path as this module, so importing both conflicts.
 
 ## License
 
