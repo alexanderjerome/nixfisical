@@ -49,7 +49,9 @@ python3Packages.buildPythonApplication rec {
     "nixfisical.access"
     "nixfisical.api"
     "nixfisical.bootstrap"
+    "nixfisical.generate"
     "nixfisical.reconcile"
+    "nixfisical.store"
   ];
 
   meta = with lib; {

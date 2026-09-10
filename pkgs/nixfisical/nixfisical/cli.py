@@ -1,17 +1,27 @@
 """Command-line interface.
 
-Four commands, mapping onto the two jobs described in the package docstring:
+Commands map onto the jobs described in the package docstring:
 
     nixfisical bootstrap   one-time instance initialisation
     nixfisical sync        converge the instance onto a manifest
+    nixfisical sync-access grant manifest groups project access
     nixfisical validate    check a manifest, offline
     nixfisical status      is the instance up, and can we still log in?
+    nixfisical secrets     manage the SOPS store the manifest reads from
+
+``secrets`` is the local half of the tool and talks to no instance. It is here
+rather than in a separate binary because it operates on exactly the files the
+manifest points at: the same ``FILE:KEY`` grammar, the same ``sops`` wrapper,
+the same rule that a value never reaches stdout unless asked for by name. An
+estate that keeps its source of truth in SOPS and projects it into Infisical
+should not need two tools to do it.
 
 Exit codes are contractual because deploy scripts branch on them:
 
     0  success
     1  runtime error (network, API, SOPS, git)
-    2  validation failure (a bad manifest, a refused re-bootstrap)
+    2  validation failure (a bad manifest, a refused re-bootstrap, a store
+       whose destinations disagree)
 
 ``status`` is the intended guard in front of ``bootstrap`` in an activation
 script: run it, and only bootstrap when it reports the instance is reachable
@@ -20,6 +30,8 @@ and not yet initialised.
 
 from __future__ import annotations
 
+import os
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -44,10 +56,12 @@ from nixfisical.bootstrap import (
     read_sync_credentials,
     split_file_key,
 )
+from nixfisical.generate import GenerateError, KINDS, kind_help
 from nixfisical.manifest import load as load_manifest
 from nixfisical.manifest import resolve_paths, validate as validate_manifest
 from nixfisical.reconcile import reconcile as run_reconcile
 from nixfisical.sops import SopsError, extract, sops_key_expr
+from nixfisical import store as store_ops
 
 EXIT_OK = 0
 EXIT_RUNTIME = 1
@@ -616,6 +630,411 @@ def status_command(ctx: click.Context) -> None:
             sys.exit(EXIT_RUNTIME)
 
         click.secho(f"sync login : ok ({admin_file})", fg="green")
+
+
+# --------------------------------------------------------------------------
+# secrets -- the local SOPS store
+# --------------------------------------------------------------------------
+
+
+def _store_fail(exc: Exception) -> None:
+    """Map a store-layer exception onto the contractual exit codes."""
+    if isinstance(exc, (store_ops.StoreError, GenerateError)):
+        _fail(str(exc), EXIT_VALIDATION)
+    else:
+        _fail(str(exc))
+
+
+def _resolve_age_key(explicit: Path | None) -> None:
+    """Point sops at an age key, and say so when we had to guess.
+
+    sops resolves its own key material from the environment and we do not
+    second-guess that -- except for one narrow case. An operator running this
+    outside a devshell that exports ``SOPS_AGE_KEY_FILE`` almost always has the
+    key at the conventional path, and failing with "no key" when it is sitting
+    right there is unhelpful. So: use it, and print that we did, on stderr, so
+    the guess is visible and correctable rather than magic.
+    """
+    if explicit is not None:
+        os.environ["SOPS_AGE_KEY_FILE"] = str(Path(explicit).expanduser())
+        return
+    if os.environ.get("SOPS_AGE_KEY") or os.environ.get("SOPS_AGE_KEY_FILE"):
+        return
+    fallback = Path.home() / ".ssh" / "sops-age.key"
+    if fallback.is_file():
+        os.environ["SOPS_AGE_KEY_FILE"] = str(fallback)
+        click.secho(
+            f"note: SOPS_AGE_KEY_FILE was unset; using {fallback}",
+            fg="yellow",
+            err=True,
+        )
+
+
+def _store_file(ctx: click.Context, override: Path | None) -> Path:
+    """The secrets file a command should act on."""
+    chosen = override or ctx.obj.get("secrets_file")
+    if chosen is None:
+        raise click.UsageError(
+            "no secrets file: pass --file, or set NIXFISICAL_SECRETS_FILE"
+        )
+    return Path(chosen).expanduser()
+
+
+@cli.group("secrets")
+@click.option(
+    "-f",
+    "--file",
+    "secrets_file",
+    envvar="NIXFISICAL_SECRETS_FILE",
+    default=None,
+    type=click.Path(path_type=Path),
+    help="Secrets file these commands act on, and the file bare KEY forms "
+    "resolve against. Also read from NIXFISICAL_SECRETS_FILE.",
+)
+@click.option(
+    "--age-key-file",
+    default=None,
+    type=click.Path(path_type=Path),
+    help="Age key to decrypt with. Defaults to sops' own resolution "
+    "(SOPS_AGE_KEY / SOPS_AGE_KEY_FILE), then to ~/.ssh/sops-age.key.",
+)
+@click.pass_context
+def secrets_group(
+    ctx: click.Context, secrets_file: Path | None, age_key_file: Path | None
+) -> None:
+    """Manage the SOPS store: read, write, and generate secret material.
+
+    Talks to no Infisical instance -- these commands operate on the encrypted
+    files the manifest points at, which are the source of truth. Nothing prints
+    a secret value unless a command exists solely to do that (``get``, and
+    ``gen --print``).
+
+    Keys are slash-delimited (``oidc/mealie/client_secret``). Anywhere a
+    destination is taken it may be written ``FILE:KEY`` to name a different
+    file, matching the ``--admin-email-from`` grammar.
+
+    Exits 2 on an operator error -- an unknown key, an unknown kind, a store
+    whose copies of a shared secret disagree -- and 1 when sops itself fails.
+    """
+    ctx.ensure_object(dict)
+    ctx.obj["secrets_file"] = secrets_file
+    _resolve_age_key(age_key_file)
+
+
+@secrets_group.command("list")
+@click.option(
+    "-f",
+    "--file",
+    "secrets_file",
+    default=None,
+    type=click.Path(path_type=Path),
+    help="Secrets file to act on. Overrides the group's --file / "
+    "NIXFISICAL_SECRETS_FILE.",
+)
+@click.pass_context
+def secrets_list_command(ctx: click.Context, secrets_file: Path | None) -> None:
+    """List every key path in the store. Prints names, never values."""
+    file = _store_file(ctx, secrets_file)
+    try:
+        paths = store_ops.list_paths(file)
+    except (store_ops.StoreError, SopsError) as exc:
+        _store_fail(exc)
+        return
+    for path in paths:
+        click.echo(path)
+    click.secho(f"{len(paths)} key(s) in {file}", fg="green", err=True)
+
+
+@secrets_group.command("get")
+@click.argument("key")
+@click.option(
+    "-f",
+    "--file",
+    "secrets_file",
+    default=None,
+    type=click.Path(path_type=Path),
+    help="Secrets file to act on. Overrides the group's --file / "
+    "NIXFISICAL_SECRETS_FILE.",
+)
+@click.option(
+    "-n",
+    "--no-newline",
+    is_flag=True,
+    default=False,
+    help="Omit the trailing newline, for tools that mind.",
+)
+@click.pass_context
+def secrets_get_command(
+    ctx: click.Context, key: str, secrets_file: Path | None, no_newline: bool
+) -> None:
+    """Print one value, bare, on stdout.
+
+    Safe in command substitution -- every diagnostic goes to stderr, so this
+    replaces `sops -d --extract '["a"]["b"]' file.yaml`:
+
+        export PGPASSWORD=$(nixfisical secrets get authentik -f secrets/infra-db.yaml)
+    """
+    file = _store_file(ctx, secrets_file)
+    try:
+        value = store_ops.get_value(file, key)
+    except (store_ops.StoreError, SopsError) as exc:
+        _store_fail(exc)
+        return
+    click.echo(value, nl=not no_newline)
+
+
+@secrets_group.command("set")
+@click.argument("key")
+@click.argument("value", required=False)
+@click.option(
+    "-f",
+    "--file",
+    "secrets_file",
+    default=None,
+    type=click.Path(path_type=Path),
+    help="Secrets file to act on. Overrides the group's --file / "
+    "NIXFISICAL_SECRETS_FILE.",
+)
+@click.option(
+    "--stdin",
+    "from_stdin",
+    is_flag=True,
+    default=False,
+    help="Read the value from stdin. Use for multi-line material (a PEM chain, "
+    "a private key) -- a trailing newline is stripped.",
+)
+@click.option(
+    "--replace",
+    is_flag=True,
+    default=False,
+    help="Refuse to create the key; only overwrite one that already exists. "
+    "Guards a rotation against a typo'd path that would silently add a "
+    "second, unread key beside the real one.",
+)
+@click.pass_context
+def secrets_set_command(
+    ctx: click.Context,
+    key: str,
+    value: str | None,
+    secrets_file: Path | None,
+    from_stdin: bool,
+    replace: bool,
+) -> None:
+    """Write one value, creating the file if it does not exist yet.
+
+    With no VALUE and no --stdin the value is prompted for, hidden and
+    confirmed. That is the default because a secret passed as an argument is
+    a secret in the shell history and in every /proc/*/cmdline on the box.
+    """
+    file = _store_file(ctx, secrets_file)
+
+    if from_stdin:
+        if value is not None:
+            raise click.UsageError("pass a VALUE or --stdin, not both")
+        value = sys.stdin.read().rstrip("\n")
+    elif value is None:
+        value = click.prompt(
+            f"value for {key}", hide_input=True, confirmation_prompt=True
+        )
+    if not value:
+        _fail("refusing to write an empty value", EXIT_VALIDATION)
+        return
+
+    try:
+        change = store_ops.set_value(file, key, value, must_exist=replace)
+    except (store_ops.StoreError, SopsError, OSError) as exc:
+        _store_fail(exc)
+        return
+    click.secho(change.render(), fg="green")
+
+
+@secrets_group.command("rm")
+@click.argument("key")
+@click.option(
+    "-f",
+    "--file",
+    "secrets_file",
+    default=None,
+    type=click.Path(path_type=Path),
+    help="Secrets file to act on. Overrides the group's --file / "
+    "NIXFISICAL_SECRETS_FILE.",
+)
+@click.option("-y", "--yes", is_flag=True, default=False, help="Skip confirmation.")
+@click.pass_context
+def secrets_rm_command(
+    ctx: click.Context, key: str, secrets_file: Path | None, yes: bool
+) -> None:
+    """Delete one key, pruning any map the deletion leaves empty."""
+    file = _store_file(ctx, secrets_file)
+    if not yes:
+        click.confirm(f"remove {key} from {file}?", abort=True)
+    try:
+        change = store_ops.remove_value(file, key)
+    except (store_ops.StoreError, SopsError, OSError) as exc:
+        _store_fail(exc)
+        return
+    click.secho(change.render(), fg="green")
+
+
+@secrets_group.command("edit")
+@click.option(
+    "-f",
+    "--file",
+    "secrets_file",
+    default=None,
+    type=click.Path(path_type=Path),
+    help="Secrets file to act on. Overrides the group's --file / "
+    "NIXFISICAL_SECRETS_FILE.",
+)
+@click.pass_context
+def secrets_edit_command(ctx: click.Context, secrets_file: Path | None) -> None:
+    """Open the store in $EDITOR through sops (decrypt, edit, re-encrypt).
+
+    Execs sops rather than wrapping it, so the editor gets the real terminal
+    and sops' own scratch-file handling applies -- plaintext never lands in a
+    file this process created.
+    """
+    file = _store_file(ctx, secrets_file)
+    sops = shutil.which("sops")
+    if sops is None:
+        _fail("the 'sops' binary is not on PATH")
+        return
+    os.execv(sops, [sops, str(file)])  # noqa: S606 - path came from which()
+
+
+@secrets_group.command(
+    "gen",
+    epilog="kinds:\n" + kind_help(),
+    context_settings={"max_content_width": 100},
+)
+@click.argument("kind", required=False, type=click.Choice(sorted(KINDS)))
+@click.option(
+    "-f",
+    "--file",
+    "secrets_file",
+    default=None,
+    type=click.Path(path_type=Path),
+    help="File that bare-KEY --into destinations resolve against.",
+)
+@click.option(
+    "--into",
+    "into",
+    multiple=True,
+    metavar="FILE:KEY|KEY",
+    help="Where the value must end up. Repeat for a secret shared between "
+    "files; every destination ends up holding the same bytes.",
+)
+@click.option(
+    "--plan",
+    "plan_file",
+    default=None,
+    type=click.Path(path_type=Path),
+    help="Read a YAML plan describing several secrets at once. See "
+    "`nixfisical.store.load_plan` for the schema.",
+)
+@click.option(
+    "--length",
+    default=None,
+    type=int,
+    help="Output characters. Defaults to the kind's own default.",
+)
+@click.option(
+    "--rotate",
+    is_flag=True,
+    default=False,
+    help="Replace whatever is there with fresh material. Without this, an "
+    "existing value is kept and copied to any destination missing it.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Report what would be written. Generates nothing and writes nothing.",
+)
+@click.option(
+    "--print",
+    "print_value",
+    is_flag=True,
+    default=False,
+    help="Also print the value on stdout. For the one case that needs it -- "
+    "pasting a bootstrap password into a UI once. Not for scripts: use "
+    "`secrets get`, which reads the store rather than racing it.",
+)
+@click.pass_context
+def secrets_gen_command(
+    ctx: click.Context,
+    kind: str | None,
+    secrets_file: Path | None,
+    into: tuple[str, ...],
+    plan_file: Path | None,
+    length: int | None,
+    rotate: bool,
+    dry_run: bool,
+    print_value: bool,
+) -> None:
+    """Generate secret material and place it, idempotently.
+
+    The point of this verb is that a shared credential is generated ONCE and
+    written to every place that needs it, in one auditable operation:
+
+        nixfisical secrets gen alnum --length 48 \\
+            --into secrets/authentik.yaml:db_password \\
+            --into secrets/infra-db.yaml:authentik
+
+    Re-running is a no-op. Adding a fourth consumer later and re-running
+    copies the existing value into it rather than rotating the other three.
+    If the destinations already disagree, this refuses and says so -- that is
+    a bug in the store, and resolving it is not a decision to make silently.
+    """
+    default_file = secrets_file or ctx.obj.get("secrets_file")
+    if plan_file is not None:
+        if kind or into:
+            raise click.UsageError("pass --plan, or a KIND with --into; not both")
+    elif not kind or not into:
+        raise click.UsageError("a KIND and at least one --into are required")
+
+    try:
+        if plan_file is not None:
+            entries = store_ops.load_plan(plan_file, default_file)
+        else:
+            entries = [
+                store_ops.PlanEntry(
+                    kind=kind or "",
+                    length=length,
+                    destinations=[
+                        store_ops.parse_destination(spec, default_file, what="--into")
+                        for spec in into
+                    ],
+                )
+            ]
+
+        written = 0
+        for entry in entries:
+            if entry.note:
+                click.echo(f"{entry.note}:")
+            outcome = store_ops.ensure_generated(
+                entry.destinations,
+                kind=entry.kind,
+                length=entry.length,
+                rotate=rotate,
+                dry_run=dry_run,
+            )
+            for change in outcome.changes:
+                click.echo(f"  {change.render()}")
+            click.echo(f"  {outcome.headline()}")
+            written += outcome.written
+            if print_value and outcome.value is not None and not dry_run:
+                click.echo(outcome.value)
+    except (store_ops.StoreError, GenerateError, SopsError, OSError) as exc:
+        _store_fail(exc)
+        return
+
+    click.secho(
+        ("DRY RUN " if dry_run else "")
+        + f"{len(entries)} secret(s), {written} destination(s) "
+        + ("to write" if dry_run else "written"),
+        fg="yellow" if dry_run else "green",
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover

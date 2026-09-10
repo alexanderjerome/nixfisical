@@ -269,6 +269,7 @@ nixfisical sync          converge the instance onto a manifest
 nixfisical sync-access   grant manifest groups access to their projects
 nixfisical validate      check a manifest offline (exit 2 on problems)
 nixfisical status        is it reachable, and does the sync identity still work
+nixfisical secrets       read, write and mint the SOPS values the rest reads
 ```
 
 Bootstrap is the destructive one, so it is guarded properly. If the admin file
@@ -327,6 +328,87 @@ it is verified against is recorded in `access.py` as
 
 Run it with `--dry-run` first; it reports every group it would create and
 every grant it would make, and writes nothing.
+
+### Minting and editing secrets
+
+`secrets` is the local half of the tool. It talks to no instance — it operates
+on exactly the SOPS files the manifest points at, which is why it lives here
+rather than in a second binary. An estate that keeps its source of truth in
+SOPS and projects it into Infisical should not need two tools to do it.
+
+```
+nixfisical secrets list                    every leaf key path in a store
+nixfisical secrets get KEY                 one value, to stdout
+nixfisical secrets set KEY [VALUE]         prompted and confirmed if VALUE is omitted
+nixfisical secrets rm  KEY                 delete a key, pruning emptied parents
+nixfisical secrets edit                    hand off to `sops` on the whole file
+nixfisical secrets gen  KIND               mint fresh material
+```
+
+The store is named once with `-f/--file` or `$NIXFISICAL_SECRETS_FILE`, on the
+group or on any subcommand.
+
+`set` with no `VALUE` and no `--stdin` prompts hidden and confirms, because a
+secret passed as an argument is a secret in the shell history and in every
+`/proc/*/cmdline` on the box. `--stdin` reads the whole of stdin verbatim, so
+multi-line material — a PEM, a private key — round-trips byte for byte.
+
+**`gen` converges, it does not overwrite.** The reason it takes `--into` more
+than once is that shared credentials are the common case: Authentik's Postgres
+password belongs in the Authentik host's file *and* in the database host's,
+an OAuth2 client secret in the provider's file *and* the consumer's. Minting
+those by hand means generating once and pasting twice, and the failure mode is
+not an error — it is two files that agree today and diverge at the next
+rotation, surfacing months later as an authentication failure somewhere
+unrelated.
+
+```sh
+nixfisical secrets gen alnum --length 48 \
+    --into secrets/authentik.yaml:db_password \
+    --into secrets/infra-db.yaml:authentik
+```
+
+So, given N destinations: if none hold a value it generates one and writes it
+to all N; if some hold the same value it propagates that value to the rest and
+generates nothing; if all agree it does nothing and exits 0; and if they
+*disagree* it refuses, names them, and demands `--rotate` — because deciding
+which copy is the stale one is not a call this tool should make silently.
+Re-running is a no-op. Adding a fourth consumer later and re-running copies
+the existing value into it rather than rotating the other three.
+
+Kinds are named rather than spelled out in `openssl` flags, so the next person
+reads `kind: alnum, length: 48` and knows what is in the store without
+decrypting it: `alnum`, `hex`, `urlsafe`, `base64`, `password`, `uuid`.
+`--length` always counts **output characters**, for every kind — unlike
+`openssl rand`, which counts input bytes, and where `-base64 32` yields 44
+characters rather than 32. Lengths below 12 are refused.
+
+A service needs six or seven secrets at once, so `--plan` takes the whole set
+at once. It is reviewable in a PR and, because generation converges, safe to
+re-run at any time:
+
+```yaml
+# secrets/authentik.plan.yaml
+file: secrets/authentik.yaml     # default store for the bare keys below
+secrets:
+  - kind: urlsafe
+    length: 60
+    note: AUTHENTIK_SECRET_KEY
+    into: [secret_key]
+  - kind: alnum
+    length: 48
+    note: shared with the database host, must stay byte-identical
+    into:
+      - db_password
+      - secrets/infra-db.yaml:authentik
+```
+
+Paths in a plan resolve relative to the plan file's own directory, so a plan
+travels with the repo it describes. `--dry-run` reports every write it would
+make and performs none. `--print` writes the generated value to stdout for the
+one case that needs it — pasting a bootstrap password into a UI once. It is
+not for scripts; those should use `secrets get`, which reads the store rather
+than racing it.
 
 ## What it does not do yet
 
