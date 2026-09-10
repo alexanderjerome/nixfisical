@@ -32,6 +32,7 @@ see it.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -340,13 +341,22 @@ def load_plan(path: Path, default_file: Path | None = None) -> list[PlanEntry]:
     if not isinstance(document, dict):
         raise StoreError(f"{path} must be a mapping with a 'secrets' list")
 
-    base = path.parent
+    # Anchor to the plan's directory once, here, and make every destination
+    # absolute from that point on. The trap this avoids: a bare key inherits
+    # `fallback`, so if `fallback` is left relative it gets anchored a second
+    # time in the loop below and `file: ../authentik.yaml` resolves to
+    # `plans/plans/../authentik.yaml`. Absolute is the marker for "already
+    # anchored"; `abspath` rather than `resolve` so a repo reached through a
+    # symlink still matches creation rules written for its logical layout.
+    base = Path(os.path.abspath(path)).parent
     plan_default = document.get("file")
     fallback = default_file
     if plan_default:
         fallback = Path(plan_default)
         if not fallback.is_absolute():
             fallback = base / fallback
+    if fallback is not None:
+        fallback = Path(os.path.abspath(fallback))
 
     entries_raw = document.get("secrets")
     if not isinstance(entries_raw, list) or not entries_raw:
@@ -369,7 +379,11 @@ def load_plan(path: Path, default_file: Path | None = None) -> list[PlanEntry]:
         destinations = []
         for spec in into:
             dest = parse_destination(str(spec), fallback, what=f"{where} 'into'")
-            file = dest.file if dest.file.is_absolute() else base / dest.file
+            file = (
+                dest.file
+                if dest.file.is_absolute()
+                else Path(os.path.abspath(base / dest.file))
+            )
             destinations.append(Destination(file=file, key=dest.key))
 
         length = raw.get("length")
