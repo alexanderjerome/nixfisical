@@ -8,6 +8,18 @@
 # Neither is built. Both are scaffolded because the project-type mechanism is
 # the same one 90-pki.nix uses, and a module that models `type` as a real
 # option gets all four for the price of one.
+#
+# LICENCE, and it differs between the two halves of this file. Secret scanning
+# is gated whole: nine sites in secret-scanning-v2-service.ts, all on
+# `plan.secretScanning`, so every route below it refuses.
+#
+# KMS is barely gated at all, which is the surprise. Nothing under
+# `services/kms/` consults the plan — keys, encrypt, decrypt, sign, MAC all
+# work unlicensed with the built-in provider, and even pointing a project at a
+# KMS key (`updateProjectKmsKey`) has only a permission check. `externalKms`
+# gates exactly two things: defining an external provider (AWS, GCP, an HSM) in
+# external-kms-service.ts, and a project KMS key backup or restore. So on this
+# instance the KMS half of this file is buildable and the scanning half is not.
 {
   infisical.instances.lab.projects = {
 

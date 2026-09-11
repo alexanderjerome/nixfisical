@@ -80,6 +80,14 @@
       # connections, dynamic secrets, identity auth, HSM connectors, PKI
       # discovery. For a homelab that is most of the interesting half of the
       # product, because most of it is on the far side of a firewall.
+      #
+      # LICENCE: gated on `plan.gateway`, which is false on an unlicensed
+      # self-hosted instance. The check is in the gateway service at the
+      # *handshake*, not at declaration time, so nothing complains until a
+      # gateway tries to register and is refused. `nixfisical license` reports
+      # it up front. Without one, Infisical reaches only what it can route to
+      # directly — which for a homelab usually means giving the instance a path
+      # to the target, or keeping the credential in SOPS and pushing outward.
       gateways = {
         # The simplest method, and the one with a bearer token to look after.
         # The body is literally { method = "token"; } — there is nothing to
@@ -123,8 +131,13 @@
       # There is no way to declare one. `gatewayPoolId` appears as a foreign
       # key on gateway auth, identity auth, dynamic secrets, identity
       # templates, HSM connectors and PKI discovery jobs, and there is no
-      # POST anywhere in 1479 paths that creates a pool. Either it is EE-only
-      # or unreleased.
+      # POST anywhere in 1479 paths that creates a pool.
+      #
+      # That resolved to *both* of the guesses, not either: pools are an `ee`
+      # route, so they are absent from the spec, and the service gates creation
+      # on `plan.gatewayPool` — another flag that is false unlicensed. So a pool
+      # is undocumented and licensed, and on this instance it is neither
+      # declarable nor creatable by hand.
       #
       # Treat a pool id as an opaque value obtained from somewhere else. Do
       # not plan on managing one.
@@ -159,6 +172,13 @@
         # declared. Set "abort" when the declaration is the contract and a
         # silent gap is worse than a failed deploy.
         onUnsupported = "warn"; # "warn" | "abort"
+
+        # This is decided against the plan the instance reports, not against a
+        # guess: the run reads GET /api/v1/organizations/{id}/plan first, which
+        # the sync identity may do on its own. So "the licence forbids this" is
+        # a measurement, and a gated call that fails on a *licensed* instance is
+        # reported as the real error it is rather than blamed on the plan.
+        # `nixfisical license` asks the same question by hand.
 
         # Mutating secret calls can come back with { approval } instead of
         # { secret } when an EE approval policy covers the path. The request

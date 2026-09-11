@@ -4,8 +4,14 @@ Infisical is one codebase with two feature sets. Self-hosted without a license
 key runs ``getDefaultOnPremFeatures()``, which returns a ``TFeatureSet`` with
 most flags hard-coded ``false``; with a key, the flags come from the license
 server. Every gated operation then reads the same object and throws
-``BadRequestError`` when its flag is off. At v0.165.8 that is 166 call sites
-across 38 distinct flags.
+``BadRequestError`` when its flag is off. At v0.165.8 that is 214 negated
+checks across 45 distinct flags.
+
+(Counting them takes more care than it looks. The gates are not uniformly
+``plan.x``: several use optional chaining, ``plan?.x``, and several bind the
+object to a local first -- ``orgLicensePlan.subOrganization`` is the one that
+made this worth writing down. A grep for ``plan\\.`` alone finds 166 and misses
+a quarter of them, including every ``rbac`` gate but four.)
 
 The point of this module is to move that discovery from *after* the failure to
 *before* it.
@@ -135,7 +141,7 @@ class Capability:
 
 
 # Only the operations this tool can actually attempt. Deliberately not the full
-# 38-flag list: a table that catalogues features nixfisical will never call is a
+# 45-flag list: a table that catalogues features nixfisical will never call is a
 # table nobody updates, and a stale gate map is worse than none -- it would skip
 # work the instance permits.
 #
@@ -223,7 +229,12 @@ CAPABILITIES: dict[str, Capability] = {
     ),
     "external-kms": Capability(
         feature="externalKms",
-        summary="attach an external KMS, or encrypt a project under one",
+        summary="define an external KMS provider, or back up a project's KMS key",
+        workaround=(
+            "Only the external provider is gated. Infisical's built-in KMS -- "
+            "keys, encrypt, decrypt, sign, MAC, and pointing a project at a key "
+            "-- consults no licence at all."
+        ),
     ),
     "sub-organization": Capability(
         feature="subOrganization",

@@ -1,5 +1,12 @@
 # Secret rotations: 28 kinds of credential that Infisical changes for us.
 #
+# LICENCE: gated on `plan.secretRotation`, false on an unlicensed self-hosted
+# instance. Nothing in this file is declarable there. The nearest substitute is
+# `nixfisical secrets gen --rotate`, which mints a new value into SOPS for the
+# next sync to push — the same end state, minus the two-username overlap below,
+# so consumers see a hard cutover rather than a grace interval. Check with
+# `nixfisical license` before designing around any of this.
+#
 # A rotation owns a credential at the provider and writes the current value
 # back into the project as ordinary secrets. Something reads those secrets
 # and gets whatever is valid now.

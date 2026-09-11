@@ -215,10 +215,26 @@
     # `onUnsupported = "warn"` is the default in 10-instance.nix — the
     # secrets still sync, the RBAC does not, and the run says so.
     #
-    # Worth confirming against the live server before building any of this.
-    # If groups are unavailable, the per-path RBAC that motivates replacing
-    # `groups = [ ... ]` is unavailable too, and the annotation's coarse
-    # behaviour was not a design error so much as the only thing that worked.
+    # CONFIRMED, against v0.165.8's getDefaultOnPremFeatures(): `groups` and
+    # `rbac` are both false, so this is not a caveat, it is the situation. And
+    # the second half of the guess above was right too — the per-path RBAC that
+    # motivates replacing `groups = [ ... ]` needs `rbac`, so the annotation's
+    # coarse project-wide behaviour was not a design error. It was the only
+    # thing that worked.
+    #
+    # Which part of `rbac` bites is worth being precise about, because it is
+    # narrower than "RBAC is off": it gates creating a custom role at all, and
+    # assigning a custom role to a user, group or identity. The four roles
+    # Infisical ships — admin, member, viewer, no-access — are ungated, and
+    # upstream tells them apart the same way, by `isCustomRole`. That is why
+    # `sync-access` grants work on this instance and why its default is
+    # `viewer`. The `cli-proxy-ro` and `mealie-ro` roles above are custom, so
+    # they are the part that will not exist.
+    #
+    # Meanwhile `permission-service.ts` resolves group-derived permissions
+    # without consulting the licence at all. Upstream gates the mutation, not
+    # the evaluation — which is why `sync-access --create-missing-groups` can
+    # write the rows directly and the running server honours them.
     organization.groups.developers = {
       name = "Developers";
       role = "member";
@@ -230,12 +246,23 @@
     # KMS, no gateways. Files 50 through 93 describe roughly a thousand of
     # the API's 1479 paths and the lab uses none of them.
     #
-    # The nearest thing to a real candidate is a gateway: infra-db and
+    # The nearest thing to a real candidate was a gateway: infra-db and
     # tofu-db are on a private VLAN, and a gateway is what would let
     # Infisical rotate their passwords rather than us minting them with
-    # `nixfisical secrets gen` and committing the ciphertext. That is the
-    # first thing in this directory worth actually building, and it is still
-    # a long way behind getting the declaration model right for the two
-    # secrets that exist.
+    # `nixfisical secrets gen` and committing the ciphertext.
+    #
+    # Except a gateway needs `plan.gateway`, refused at the handshake, and
+    # rotation needs `plan.secretRotation`. Both false here. So the whole
+    # candidate is off the table on this instance, and `secrets gen` writing
+    # into SOPS is not the stopgap before the good version — for an unlicensed
+    # self-hosted instance it *is* the version. Worth knowing before spending
+    # an evening on the gateway.
+    #
+    # What the licence leaves is most of what the lab uses: projects,
+    # environments, folders, secrets, the sync itself, secret versioning
+    # (which is on without a licence), built-in role grants, and a second
+    # organization via `add-org`. The declaration model for the two secrets
+    # that exist was always the thing in front; now it is also the thing
+    # that can be built.
   };
 }

@@ -1,5 +1,11 @@
 # Dynamic secrets: credentials that do not exist until something asks.
 #
+# LICENCE: gated on `plan.dynamicSecret`, false on an unlicensed self-hosted
+# instance, and there is no substitute — the whole point is a credential with a
+# lifetime shorter than a deploy, which a SOPS file cannot have. Unlike
+# rotation there is no degraded version worth writing. `nixfisical license`
+# says whether this instance has it.
+#
 # The difference from a rotation (70-rotations.nix) is not the interval, it
 # is the ownership. A rotation keeps a credential alive and changes it
 # periodically; the credential exists between rotations and is stored as a
