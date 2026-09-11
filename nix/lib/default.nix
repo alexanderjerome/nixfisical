@@ -47,10 +47,21 @@ rec {
       perHost = lib.mapAttrsToList
         (host: node:
           lib.mapAttrsToList
-            (key: sec:
-              let e = sec.infisical or null; in
+            (attr: sec:
+              let
+                e = sec.infisical or null;
+                # The attribute name is NOT the lookup path. sops-nix resolves a
+                # value with `sops.secrets.<attr>.key`, which merely *defaults*
+                # to <attr>; declaring `key` is the normal way to give a secret
+                # a descriptive name on the host while the encrypted file stays
+                # flat. Reading <attr> here produced a manifest that rendered,
+                # validated and then failed mid-sync against a real instance
+                # with "sops key 'cli-proxy/api_key' not found (no 'cli-proxy'
+                # under <root>)" -- the file's key was `api_key`.
+                sopsKey = sec.key or attr;
+              in
               if e == null then null else {
-                sopsKey = key;
+                inherit sopsKey;
                 sopsFile =
                   if (sec.sopsFile or null) != null
                   then toString sec.sopsFile
@@ -59,7 +70,7 @@ rec {
                 inherit (e) project environment folder groups;
                 # Default the Infisical-side name to the last segment of the
                 # SOPS key: "services/bitcoin/rpc_password" -> "rpc_password".
-                name = if e.name != null then e.name else lib.last (lib.splitString "/" key);
+                name = if e.name != null then e.name else lib.last (lib.splitString "/" sopsKey);
               })
             (node.config.sops.secrets or { }))
         nixosConfigurations;
@@ -101,14 +112,26 @@ rec {
         manifest;
       badFolder = lib.filter (e: !(lib.hasPrefix "/" e.folder)) manifest;
 
+      # `sops.secrets.<n>.key = ""` is sops-nix for "the whole file", which has
+      # no single value to mirror. Caught here because an empty sopsKey reaches
+      # the CLI as a lookup that cannot be phrased, let alone explained.
+      emptyKey = lib.filter (e: e.sopsKey == "") manifest;
+
       err = msg: entries:
         lib.optional (entries != [ ])
           "${msg}: ${lib.concatMapStringsSep ", " (e: e.sopsKey) entries}";
 
+      # Same, for problems where the sopsKey is itself the thing that is wrong
+      # and so cannot name the offender.
+      errBy = msg: entries:
+        lib.optional (entries != [ ])
+          "${msg}: ${lib.concatMapStringsSep ", " (e: "${e.project}${e.folder}:${e.name}") entries}";
+
       problems =
         (err "secrets with no sopsFile (set sops.defaultSopsFile or a per-secret sopsFile)" missingFile)
         ++ (err "environment slugs must match [a-z0-9-]+" badEnv)
-        ++ (err "folder paths must be absolute (start with /)" badFolder);
+        ++ (err "folder paths must be absolute (start with /)" badFolder)
+        ++ (errBy "whole-file secrets (key = \"\") cannot be exported; name a key" emptyKey);
     in
     if problems == [ ]
     then manifest

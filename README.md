@@ -76,6 +76,12 @@ in the Nix store:
 ]
 ```
 
+`sopsKey` is the path *inside the encrypted file*, which is
+`sops.secrets.<n>.key` and only defaults to the attribute name. If you name an
+attribute `cli-proxy/api_key` for legibility on the host and set
+`key = "api_key"` because the file is flat, the manifest exports `api_key`.
+`name` defaults to the last segment of that same resolved key.
+
 `nixfisical sync` reads that, decrypts each value **on your machine at run
 time**, and converges the remote instance onto it: missing projects,
 environments and folders get created, values get upserted, and secrets the

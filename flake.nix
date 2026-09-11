@@ -157,17 +157,27 @@
           # NixOS system or sops-nix.
           manifest = pkgs.runCommand "nixfisical-manifest-check" { } (
             let
-              # Minimal stand-in for the one sops-nix option the manifest walk
+              # Minimal stand-in for the sops-nix options the manifest walk
               # reads, so the check stays free of a sops-nix input. Same
               # merge trick the export module uses.
+              #
+              # `key` must be modelled, and modelled with sops-nix's default of
+              # the attribute name. An earlier stub declared only `sopsFile`,
+              # so every secret looked like one whose key was its attribute
+              # name -- the check went green on a manifest that could not
+              # resolve a single value against a real instance.
               sopsFileStub = { lib, ... }: {
                 options.sops.secrets = lib.mkOption {
-                  type = lib.types.attrsOf (lib.types.submodule {
+                  type = lib.types.attrsOf (lib.types.submodule ({ name, ... }: {
                     options.sopsFile = lib.mkOption {
                       type = lib.types.nullOr (lib.types.either lib.types.str lib.types.path);
                       default = null;
                     };
-                  });
+                    options.key = lib.mkOption {
+                      type = lib.types.str;
+                      default = name;
+                    };
+                  }));
                 };
               };
 
@@ -201,6 +211,30 @@
                       name = "MAIN_PASSWORD";
                     };
                   };
+                  # Explicit `key`: the attribute is a descriptive host-side
+                  # name, the encrypted file is flat. sopsKey must follow the
+                  # key ("api_key"), not the attribute.
+                  "cli-proxy/api_key" = {
+                    sopsFile = "/fleet/secrets/cli-proxy.yaml";
+                    key = "api_key";
+                    infisical = nixfisicalLib.mkInfisical {
+                      project = "apps";
+                      folder = "/cli-proxy";
+                      name = "CLI_PROXY_API_KEY";
+                      groups = [ "developers" ];
+                    };
+                  };
+                  # Same, with the Infisical name left to default. It must
+                  # derive from the resolved key ("mealie"), not the attribute
+                  # -- which is why the attribute ends in something else.
+                  "infra-db/mealie_pw" = {
+                    sopsFile = "/fleet/secrets/infra-db.yaml";
+                    key = "mealie";
+                    infisical = nixfisicalLib.mkInfisical {
+                      project = "databases";
+                      folder = "/mealie";
+                    };
+                  };
                   # Unannotated: must never appear in the manifest.
                   "internal/root_key" = { sopsFile = "/fleet/secrets/dbs.yaml"; };
                 });
@@ -227,6 +261,16 @@
                 }
                 {
                   environment = "prod";
+                  folder = "/cli-proxy";
+                  groups = [ "developers" ];
+                  hosts = [ "alpha" ];
+                  name = "CLI_PROXY_API_KEY";
+                  project = "apps";
+                  sopsFile = "/fleet/secrets/cli-proxy.yaml";
+                  sopsKey = "api_key";
+                }
+                {
+                  environment = "prod";
                   folder = "/";
                   groups = [ ];
                   hosts = [ "alpha" ];
@@ -234,6 +278,16 @@
                   project = "databases";
                   sopsFile = "/fleet/secrets/dbs.yaml";
                   sopsKey = "dbs/main/password";
+                }
+                {
+                  environment = "prod";
+                  folder = "/mealie";
+                  groups = [ ];
+                  hosts = [ "alpha" ];
+                  name = "mealie";
+                  project = "databases";
+                  sopsFile = "/fleet/secrets/infra-db.yaml";
+                  sopsKey = "mealie";
                 }
               ];
             in
