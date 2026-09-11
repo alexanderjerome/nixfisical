@@ -3,6 +3,7 @@
 Commands map onto the jobs described in the package docstring:
 
     nixfisical bootstrap   one-time instance initialisation
+    nixfisical adopt       same end state, for an instance already initialised
     nixfisical sync        converge the instance onto a manifest
     nixfisical sync-access grant manifest groups project access
     nixfisical validate    check a manifest, offline
@@ -26,6 +27,11 @@ Exit codes are contractual because deploy scripts branch on them:
 ``status`` is the intended guard in front of ``bootstrap`` in an activation
 script: run it, and only bootstrap when it reports the instance is reachable
 and not yet initialised.
+
+``bootstrap`` and ``adopt`` are alternatives, not a sequence: they end at the
+same admin file, and which one applies is decided by whether the instance has
+ever been initialised -- a thing that cannot be undone. ``adopt`` is the
+one-way door out of "someone clicked through the setup wizard".
 """
 
 from __future__ import annotations
@@ -49,8 +55,10 @@ from nixfisical.access import (
 )
 from nixfisical.api import InfisicalClient, InfisicalError
 from nixfisical.bootstrap import (
+    DEFAULT_ADOPT_COMMIT_MESSAGE,
     DEFAULT_COMMIT_MESSAGE,
     BootstrapError,
+    adopt as run_adopt,
     bootstrap as run_bootstrap,
     read_organization_id,
     read_sync_credentials,
@@ -274,6 +282,157 @@ def bootstrap_command(
             "file -- back that file up.",
             fg="yellow",
         )
+    if git_commit and not result.committed:
+        click.secho("  admin file was not committed; see the messages above.", fg="yellow")
+
+
+# --------------------------------------------------------------------------
+# adopt
+#
+# A sibling of bootstrap rather than `bootstrap adopt`, because `bootstrap` is
+# a command and turning it into a group would move the existing spelling to
+# `bootstrap bootstrap`. The two are alternatives anyway -- exactly one of them
+# can ever apply to a given instance -- so they read better side by side.
+# --------------------------------------------------------------------------
+
+
+@cli.command("adopt")
+@click.option(
+    "--organization",
+    default=None,
+    help="Which existing organization to adopt, by id, slug or name. Optional "
+    "when the superadmin belongs to exactly one.",
+)
+@click.option(
+    "--admin-email",
+    default=None,
+    help="Superadmin email as a literal. An address is not secret; prefer this "
+    "over --admin-email-from unless it lives in SOPS already.",
+)
+@click.option(
+    "--admin-email-from",
+    default=None,
+    metavar="FILE:KEY|KEY",
+    help="Read the superadmin email from SOPS. Either FILE:KEY, or a bare "
+    "slash-delimited KEY resolved against --secrets-file.",
+)
+@click.option(
+    "--admin-password-from",
+    default=None,
+    metavar="FILE:KEY|KEY",
+    help="Read the superadmin password from SOPS. Required: unlike bootstrap, "
+    "adopt cannot generate one -- the account already exists.",
+)
+@click.option(
+    "--secrets-file",
+    default=None,
+    type=click.Path(path_type=Path),
+    help="Default SOPS file for bare-KEY forms of the two options above.",
+)
+@click.option(
+    "--identity-name",
+    default="fleet-sync",
+    show_default=True,
+    help="Name of the Universal-Auth machine identity to create.",
+)
+@click.option(
+    "--token-ttl",
+    default=2592000,
+    show_default=True,
+    type=int,
+    help="accessTokenTTL and accessTokenMaxTTL for the machine identity, in seconds.",
+)
+@click.option(
+    "--client-secret-description",
+    default="nixfisical sync identity",
+    show_default=True,
+    help="Description recorded on the minted client secret.",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Proceed even though an existing admin file's credentials cannot log "
+    "in. The existing file is still never overwritten -- move it aside first.",
+)
+@click.option(
+    "--git-commit",
+    is_flag=True,
+    default=False,
+    help="git add + git commit the encrypted admin file in its own repo. Never pushes.",
+)
+@click.option(
+    "--commit-message",
+    default=DEFAULT_ADOPT_COMMIT_MESSAGE,
+    show_default=True,
+    help="Commit message used by --git-commit.",
+)
+@click.pass_context
+def adopt_command(
+    ctx: click.Context,
+    organization: str | None,
+    admin_email: str | None,
+    admin_email_from: str | None,
+    admin_password_from: str | None,
+    secrets_file: Path | None,
+    identity_name: str,
+    token_ttl: int,
+    client_secret_description: str,
+    force: bool,
+    git_commit: bool,
+    commit_message: str,
+) -> None:
+    """Take over an already-initialised instance and record it in SOPS.
+
+    For an instance `bootstrap` can no longer reach: one set up through the web
+    UI, or whose admin file was lost. Logs in as the superadmin that already
+    exists, mints the sync identity against the organization that already
+    exists, and writes the same admin file bootstrap would have.
+
+    Safe to re-run on the same terms as bootstrap: an admin file whose identity
+    can already log in is verified and left alone.
+    """
+    admin_file: Path = ctx.obj["admin_file"]
+    with _client(ctx) as client:
+        try:
+            result = run_adopt(
+                client,
+                admin_file=admin_file,
+                organization=organization,
+                email=admin_email,
+                email_ref=admin_email_from,
+                password_ref=admin_password_from,
+                secrets_file=secrets_file,
+                identity_name=identity_name,
+                token_ttl=token_ttl,
+                client_secret_description=client_secret_description,
+                force=force,
+                git_commit=git_commit,
+                commit_message=commit_message,
+            )
+        except BootstrapError as exc:
+            _fail(str(exc), EXIT_VALIDATION)
+            return
+        except (InfisicalError, SopsError, OSError) as exc:
+            _fail(str(exc))
+            return
+
+    for message in result.messages:
+        click.echo(f"  {message}")
+
+    if result.status == "ok":
+        click.secho(f"already adopted: {admin_file} verified against {ctx.obj['url']}", fg="green")
+        return
+
+    click.secho(f"adopted {ctx.obj['url']}", fg="green")
+    click.echo(f"  organization : {result.organization_name} ({result.organization_slug})")
+    click.echo(f"  identity     : {identity_name} [{result.identity_id}]")
+    click.echo(f"  admin file   : {result.admin_file}")
+    click.secho(
+        "  the superadmin password you supplied is now recorded in the admin "
+        "file. Rotate it if it is also a human's login.",
+        fg="yellow",
+    )
     if git_commit and not result.committed:
         click.secho("  admin file was not committed; see the messages above.", fg="yellow")
 
@@ -596,6 +755,12 @@ def status_command(ctx: click.Context) -> None:
     Exits 1 when the instance is unreachable; exits 0 otherwise, including when
     the instance is up but not yet bootstrapped -- that is a legitimate state,
     not an error.
+
+    "Initialised" is read off the instance rather than inferred from whether an
+    admin file is present locally. The two are independent, and the combination
+    that used to be reported as "not bootstrapped yet" -- initialised instance,
+    no admin file -- is the one where bootstrap cannot work and ``adopt`` is
+    the answer.
     """
     admin_file: Path = ctx.obj["admin_file"]
     url = ctx.obj["url"]
@@ -608,11 +773,34 @@ def status_command(ctx: click.Context) -> None:
             return
         click.secho(f"instance   : reachable at {url}", fg="green")
 
-        if not admin_file.exists():
+        try:
+            initialized = bool(client.instance_config().get("initialized"))
+        except InfisicalError as exc:
+            click.secho(f"initialised: unknown ({exc})", fg="yellow")
+            initialized = None
+        else:
             click.secho(
-                f"admin file : {admin_file} does not exist -- not bootstrapped yet",
-                fg="yellow",
+                f"initialised: {'yes' if initialized else 'no -- run bootstrap'}",
+                fg="green" if initialized else "yellow",
             )
+
+        if not admin_file.exists():
+            if initialized:
+                click.secho(
+                    f"admin file : {admin_file} does not exist, but the instance "
+                    "is already initialised",
+                    fg="yellow",
+                )
+                click.secho(
+                    "             bootstrap cannot run against it; see "
+                    "'nixfisical adopt --help'",
+                    fg="yellow",
+                )
+            else:
+                click.secho(
+                    f"admin file : {admin_file} does not exist -- not bootstrapped yet",
+                    fg="yellow",
+                )
             return
 
         try:

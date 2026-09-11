@@ -1,10 +1,11 @@
 """HTTP client for the Infisical REST API.
 
-Scope note: this covers exactly the endpoints the Ansible role used, and no
-more. Infisical's API is large and versioned inconsistently (``/api/v1``,
-``/api/v2`` and ``/api/v3`` all appear below, and that is not a typo -- it is
-what the server exposes). Keeping the surface small keeps the blast radius of
-an upstream change small.
+Scope note: this covers the endpoints the Ansible role used, plus the four
+``adopt`` needs to log in as a human and find its way to an organization.
+Nothing else. Infisical's API is large and versioned inconsistently
+(``/api/v1``, ``/api/v2`` and ``/api/v3`` all appear below, and that is not a
+typo -- it is what the server exposes). Keeping the surface small keeps the
+blast radius of an upstream change small.
 
 Two behaviours carried over from the role deserve explanation:
 
@@ -56,6 +57,18 @@ _SECRET_FIELD_NAMES = frozenset(
 )
 
 _BODY_TRUNCATE_AT = 600
+
+# Sent on every request. Two reasons it is set explicitly rather than left to
+# httpx's default:
+#
+# * ``POST /api/v3/auth/login`` *rejects* a request with no ``User-Agent`` at
+#   all -- the handler's first statement is a throw. httpx does send a default,
+#   so this is belt and braces, but a hard server-side requirement should not
+#   rest on a client library's default staying what it is today.
+# * Infisical records the user agent on the session and in the audit log.
+#   ``python-httpx/0.27.0`` in an audit trail says nothing; this says which
+#   tool logged in.
+_USER_AGENT = "nixfisical"
 
 
 class InfisicalError(RuntimeError):
@@ -147,6 +160,7 @@ class InfisicalClient:
             verify=verify,
             timeout=timeout,
             follow_redirects=True,
+            headers={"User-Agent": _USER_AGENT},
         )
 
     # -- lifecycle ---------------------------------------------------------
@@ -231,6 +245,29 @@ class InfisicalClient:
         )
         return payload
 
+    def instance_config(self) -> dict[str, Any]:
+        """Probe ``/api/v1/admin/config`` -- the instance's own server settings.
+
+        Unauthenticated, because the login page has to know whether to offer a
+        signup link before anyone has logged in. The field we care about is
+        ``initialized``: it is the authoritative answer to "has this instance
+        been bootstrapped?", which is otherwise only knowable by trying and
+        failing.
+
+        That matters because the alternative -- inferring it from whether an
+        admin file exists on the machine running this tool -- is a property of
+        the *checkout*, not of the instance. The two disagree exactly when it
+        is most expensive: a lost admin file reads as "fresh instance, go
+        bootstrap it", and bootstrap is the one thing that cannot work there.
+        """
+        _, payload = self._request(
+            "GET",
+            "/api/v1/admin/config",
+            authenticated=False,
+            description="instance config probe",
+        )
+        return payload.get("config") or {}
+
     # -- bootstrap & identity ---------------------------------------------
 
     def bootstrap_instance(
@@ -255,6 +292,125 @@ class InfisicalClient:
             description="instance bootstrap",
         )
         return payload
+
+    # -- superadmin login (adopt only) -------------------------------------
+    #
+    # Everything else in this module authenticates as a machine identity. These
+    # three exist for one job: `nixfisical adopt`, which has to act as a human
+    # superadmin exactly long enough to mint the machine identity that replaces
+    # it. Nothing on the sync path calls them.
+    #
+    # Logging in as a user is two requests, not one. `/auth/login` issues a
+    # token with no organization attached, and `verifyAuth` defaults to
+    # `requireOrg: true` -- so that token is rejected by almost every route,
+    # including the `POST /api/v1/identities` this whole dance is for. The
+    # org-scoped token comes from `/auth/select-organization`.
+
+    def login(self, *, email: str, password: str) -> str:
+        """Log in as a user with an email and password; return the access token.
+
+        Uses ``/api/v3/auth/login``, which upstream comments as "New login route
+        that doesn't use SRP". The older ``/login1`` + ``/login2`` pair speaks
+        SRP, and reimplementing that here to avoid sending a password over an
+        already-TLS-protected channel would be a lot of cryptography for no
+        gain.
+
+        Sets ``self.token``, but that token carries **no organization**, and
+        ``verifyAuth`` defaults to requiring one -- so it opens only the few
+        routes declared ``requireOrg: false``, which here means
+        :meth:`list_organizations`, :meth:`current_user` and
+        :meth:`select_organization`. Anything else answers 401 until
+        :meth:`select_organization` has replaced it.
+        """
+        _, payload = self._request(
+            "POST",
+            "/api/v3/auth/login",
+            json={"email": email, "password": password},
+            authenticated=False,
+            description="superadmin login",
+        )
+        token = payload.get("accessToken")
+        if not token:
+            raise InfisicalError("superadmin login returned no accessToken")
+        self.token = token
+        return token
+
+    def select_organization(self, organization_id: str) -> str:
+        """Exchange an org-less user token for one scoped to an organization.
+
+        Also sets ``self.token``.
+
+        This is where MFA is enforced -- ``/auth/login`` has no MFA branch at
+        all, the check lives here. When the account requires a second factor the
+        endpoint answers 200 with ``isMfaEnabled: true`` and a *challenge*
+        token, not an access token, so a caller that blindly read ``token``
+        would carry on with a credential that authenticates nothing. We refuse
+        instead: prompting for a TOTP code belongs in an interactive tool, not
+        in something that may be running from a deploy script.
+        """
+        _, payload = self._request(
+            "POST",
+            "/api/v3/auth/select-organization",
+            json={"organizationId": organization_id},
+            description="select organization",
+        )
+        if payload.get("isMfaEnabled"):
+            method = payload.get("mfaMethod") or "an unknown method"
+            raise InfisicalError(
+                f"this account requires multi-factor authentication ({method}); "
+                "nixfisical cannot complete an MFA challenge"
+            )
+        token = payload.get("token")
+        if not token:
+            raise InfisicalError("select organization returned no token")
+        self.token = token
+        return token
+
+    def list_organizations(self) -> list[dict[str, Any]]:
+        """Return the organizations the logged-in user belongs to.
+
+        One of the few routes that accepts the org-less token from
+        :meth:`login`, which is what makes "log in, then work out which
+        organization to adopt" possible without the operator knowing an id.
+        """
+        _, payload = self._request(
+            "GET", "/api/v1/organization/", description="list organizations"
+        )
+        organizations = payload.get("organizations") or []
+        return [org for org in organizations if org.get("id")]
+
+    def current_user(self) -> dict[str, Any]:
+        """Return the logged-in user record. Used for the admin file's user id."""
+        _, payload = self._request(
+            "GET", "/api/v1/user", description="current user"
+        )
+        user = payload.get("user") or {}
+        if not user.get("id"):
+            raise InfisicalError("current user lookup returned no user id")
+        return user
+
+    def list_identities(self, organization_id: str) -> dict[str, str]:
+        """Return a ``{identity name: identity id}`` map for the organization.
+
+        Identity names are not unique in Infisical, so this cannot be used to
+        *find* an identity reliably -- it is used to notice that a name is
+        already taken before creating a second one nobody asked for.
+        """
+        _, payload = self._request(
+            "GET",
+            "/api/v1/identities",
+            params={"orgId": organization_id},
+            description="list identities",
+        )
+        memberships = payload.get("identities") or []
+        found: dict[str, str] = {}
+        for membership in memberships:
+            identity = membership.get("identity") or {}
+            if identity.get("name") and identity.get("id"):
+                found[identity["name"]] = identity["id"]
+        return found
+
+    # -- identities --------------------------------------------------------
 
     def create_identity(
         self, *, name: str, organization_id: str, role: str = "admin"

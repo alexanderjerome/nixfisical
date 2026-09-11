@@ -81,6 +81,8 @@ second list to remember to update.
 
 # 2. Bootstrap: create the superadmin, the org, and a `fleet-sync` machine
 #    identity, and record all of it in a SOPS-encrypted admin file.
+#    (Instance already initialised? Use `adopt` instead — see "Adopting an
+#    instance you did not bootstrap". `nixfisical status` will tell you which.)
 nix run github:alexanderjerome/nixfisical -- \
   --url https://infisical.example.com \
   --admin-file nix/secrets/infisical-admin.yaml \
@@ -284,6 +286,7 @@ which claims the same path, the two will conflict — pick one.
 
 ```
 nixfisical bootstrap     initialise a fresh instance, record creds in SOPS
+nixfisical adopt         same, for an instance that is already initialised
 nixfisical sync          converge the instance onto a manifest
 nixfisical sync-access   grant manifest groups access to their projects
 nixfisical validate      check a manifest offline (exit 2 on problems)
@@ -303,6 +306,56 @@ propagates.
 `--git-commit` commits the encrypted admin file (never pushes), so a
 first-deploy run leaves the credentials tracked rather than sitting untracked
 in a working tree waiting to be lost.
+
+### Adopting an instance you did not bootstrap
+
+`POST /api/v1/admin/bootstrap` succeeds exactly **once** in an instance's life.
+An instance someone clicked through the setup wizard on, or one whose admin
+file was lost with an old checkout, is therefore permanently out of
+`bootstrap`'s reach — and short of dropping its database there was no way to
+bring it under declarative management.
+
+`adopt` is that way. It ends at the same admin file, reached from the other
+side: instead of creating the superadmin and the organization it authenticates
+as the superadmin that exists and finds the organization that exists, then runs
+exactly the same tail — mint `fleet-sync`, write the file. Nothing downstream
+can tell which command produced a given admin file.
+
+```sh
+nixfisical --url https://infisical.example.com adopt \
+  --admin-email admin@example.com \
+  --admin-password-from secrets/infisical.yaml:admin_password
+```
+
+`--organization` is optional when the account belongs to exactly one; with
+more than one it is required, and the error lists them. Matching is by id,
+then slug, then name.
+
+Two differences from `bootstrap` that are not cosmetic:
+
+- **The superadmin password is an input, not an output.** Bootstrap generates
+  one that nobody ever types and the admin file is its only copy. Adopt has to
+  be *given* the password of an account a human already logs in with, and
+  records it alongside the machine credentials. Rotate it afterwards if that
+  matters. There is no generate fallback — inventing a password for an account
+  that exists would produce a confident "Invalid credentials".
+- **It refuses to reuse an identity name.** If the organization already has a
+  machine identity called `fleet-sync`, adopt stops. Infisical shows a client
+  secret once, at creation, so an existing identity cannot be adopted into an
+  admin file at all — there is nothing to read back. Delete it, or pass
+  `--identity-name`.
+
+MFA on the superadmin account stops adopt, by design. Upstream enforces it at
+organization selection rather than at login, so the refusal happens after the
+password has been accepted; completing a TOTP challenge belongs in an
+interactive tool, not in something that may be running from a deploy script.
+
+`status` reads "has this been initialised?" off the instance
+(`GET /api/v1/admin/config`) rather than inferring it from whether an admin
+file happens to exist locally. Those are independent facts, and the case where
+they disagree — initialised instance, no admin file — is exactly the one
+`adopt` exists for, so it is the one worth naming rather than mislabelling as
+"not bootstrapped yet".
 
 ### Group access
 
