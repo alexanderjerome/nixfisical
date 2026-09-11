@@ -380,6 +380,26 @@ class InfisicalClient:
         organizations = payload.get("organizations") or []
         return [org for org in organizations if org.get("id")]
 
+    def get_plan(self, organization_id: str) -> dict[str, Any]:
+        """Return the organization's resolved licence feature set.
+
+        ``GET /api/v1/organizations/{id}/plan``. Undocumented -- it is an ``ee``
+        route and appears nowhere in the OpenAPI spec -- but it accepts
+        ``AuthMode.IDENTITY_ACCESS_TOKEN``, so the sync identity can read it
+        without a human session. That is the whole reason licence awareness can
+        be a property of a run rather than something an operator types in.
+
+        The route's own response schema is ``z.object({ plan: z.any() })``, so
+        the shape is not promised by upstream either; :class:`~nixfisical.license.Plan`
+        takes it defensively. Returns the envelope as received.
+        """
+        _, payload = self._request(
+            "GET",
+            f"/api/v1/organizations/{organization_id}/plan",
+            description="read organization plan",
+        )
+        return payload
+
     def create_organization(self, name: str) -> dict[str, Any]:
         """Create an organization and return its record.
 

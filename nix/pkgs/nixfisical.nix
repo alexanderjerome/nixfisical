@@ -57,6 +57,7 @@ python3Packages.buildPythonApplication rec {
     "nixfisical.api"
     "nixfisical.bootstrap"
     "nixfisical.generate"
+    "nixfisical.license"
     "nixfisical.reconcile"
     "nixfisical.store"
   ];

@@ -9,6 +9,7 @@ Commands map onto the jobs described in the package docstring:
     nixfisical sync-access grant manifest groups project access
     nixfisical validate    check a manifest, offline
     nixfisical status      is the instance up, and can we still log in?
+    nixfisical license     which licence-gated features does it permit?
     nixfisical secrets     manage the SOPS store the manifest reads from
 
 ``secrets`` is the local half of the tool and talks to no instance. It is here
@@ -28,6 +29,12 @@ Exit codes are contractual because deploy scripts branch on them:
 ``status`` is the intended guard in front of ``bootstrap`` in an activation
 script: run it, and only bootstrap when it reports the instance is reachable
 and not yet initialised.
+
+``license`` is the same kind of guard for the other half of the question. A
+manifest can be valid and still ask for something the instance's licence will
+not permit -- groups, custom roles, a gateway -- and the server says so with a
+400 partway through the work. Reading the plan first turns that into a report.
+It exits 0 either way: an unlicensed instance is a normal instance.
 
 ``bootstrap`` and ``adopt`` are alternatives, not a sequence: they end at the
 same admin file, and which one applies is decided by whether the instance has
@@ -75,6 +82,7 @@ from nixfisical.bootstrap import (
     split_file_key,
 )
 from nixfisical.generate import GenerateError, KINDS, kind_help
+from nixfisical.license import CAPABILITIES, Plan
 from nixfisical.manifest import load as load_manifest
 from nixfisical.manifest import resolve_paths, validate as validate_manifest
 from nixfisical.reconcile import reconcile as run_reconcile
@@ -98,6 +106,21 @@ def _read_sops_ref(spec: str, secrets_file: Path | None, *, what: str) -> str:
     """Resolve a ``FILE:KEY`` or bare-``KEY`` option into a decrypted value."""
     file, key = split_file_key(spec, secrets_file, what=what)
     return extract(file, sops_key_expr(key))
+
+
+def _read_plan(client: InfisicalClient, organization_id: str) -> Plan:
+    """Read the organization's licence, or fall back to the free-tier defaults.
+
+    Never raises. The plan endpoint is an undocumented ``ee`` route, so an
+    instance that answers 404 to it is a situation this tool should survive
+    rather than one it should refuse to run against -- the fallback is the
+    pessimistic feature set, which yields a skipped feature and a warning
+    instead of a wrong success.
+    """
+    try:
+        return Plan.from_payload(client.get_plan(organization_id))
+    except InfisicalError as exc:
+        return Plan.unlicensed(f"plan endpoint unavailable: {exc}")
 
 
 def _client(ctx: click.Context) -> InfisicalClient:
@@ -883,6 +906,13 @@ def sync_access_command(
             _fail(f"could not authenticate with {admin_file}: {exc}")
             return
 
+        # Read the plan before doing anything, so that a group this run cannot
+        # create is reported as a plan restriction rather than as a failure.
+        # An unreadable plan is not fatal: sync_access falls back to the
+        # behaviour it had before there was a plan to read.
+        plan = _read_plan(client, organization_id)
+        click.secho(f"  {plan.headline()}", fg="cyan")
+
         summary = run_sync_access(
             client,
             manifest,
@@ -890,16 +920,21 @@ def sync_access_command(
             project_role=project_role,
             org_role=org_role,
             database=database,
+            plan=plan,
             dry_run=dry_run,
         )
 
     for action in summary.actions:
         click.echo(f"  {action.render()}")
 
+    for skipped in summary.skipped:
+        click.secho(f"  unsupported: {skipped}", fg="yellow", err=True)
+
     click.secho(
         ("DRY RUN " if dry_run else "") + summary.headline(),
         fg="yellow" if dry_run else ("green" if summary.ok else "red"),
     )
+    # `skipped` deliberately does not affect the exit code. See AccessSummary.
     if not summary.ok:
         sys.exit(EXIT_RUNTIME)
 
@@ -1019,6 +1054,77 @@ def status_command(ctx: click.Context) -> None:
             sys.exit(EXIT_RUNTIME)
 
         click.secho(f"sync login : ok ({admin_file})", fg="green")
+
+
+# --------------------------------------------------------------------------
+# license
+# --------------------------------------------------------------------------
+
+
+@cli.command("license")
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    default=False,
+    help="Emit the raw plan object as the instance reported it.",
+)
+@click.pass_context
+def license_command(ctx: click.Context, as_json: bool) -> None:
+    """Report which licence-gated features this instance permits.
+
+    Answers the question that otherwise gets answered by a 400 halfway through
+    a deploy. Every row is one thing nixfisical can attempt; "no" means the
+    server will refuse it no matter how the declaration is written, and the
+    note says what to do instead where there is something to do.
+
+    Exits 0 whether or not the instance is licensed. An unlicensed instance is
+    a normal instance -- this command reports, it does not judge.
+    """
+    admin_file: Path = ctx.obj["admin_file"]
+
+    with _client(ctx) as client:
+        try:
+            organization_id = read_organization_id(admin_file)
+            client.universal_auth_login(read_sync_credentials(admin_file))
+        except (SopsError, InfisicalError) as exc:
+            _fail(f"could not authenticate with {admin_file}: {exc}")
+            return
+
+        try:
+            payload = client.get_plan(organization_id)
+        except InfisicalError as exc:
+            # Unlike every other caller, this command's entire job is to read
+            # the plan -- so falling back to assumed defaults here would be
+            # answering a question it was asked to check.
+            _fail(
+                f"could not read the organization's plan: {exc}. The route is "
+                "'GET /api/v1/organizations/{id}/plan', an undocumented ee "
+                "route; a 404 means this build does not have it."
+            )
+            return
+
+    if as_json:
+        import json as _json
+
+        click.echo(_json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    plan = Plan.from_payload(payload)
+    click.secho(plan.headline(), fg="green" if plan.licensed else "yellow")
+    click.echo()
+
+    width = max(len(name) for name in CAPABILITIES)
+    for name in sorted(CAPABILITIES):
+        capability = CAPABILITIES[name]
+        allowed = plan.has(capability.feature)
+        click.secho(
+            f"  {name.ljust(width)}  {'yes' if allowed else 'no '}  "
+            f"{capability.summary}",
+            fg="green" if allowed else "yellow",
+        )
+        if not allowed and capability.workaround:
+            click.echo(f"  {' ' * width}       -> {capability.workaround}")
 
 
 # --------------------------------------------------------------------------

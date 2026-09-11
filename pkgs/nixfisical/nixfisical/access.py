@@ -47,11 +47,13 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
 from nixfisical.api import InfisicalClient, InfisicalError
+from nixfisical.license import Plan
 from nixfisical.reconcile import Action
 
 __all__ = [
     "AccessError",
     "AccessSummary",
+    "BUILTIN_PROJECT_ROLES",
     "Database",
     "DEFAULT_PROJECT_ROLE",
     "DEFAULT_ORG_ROLE",
@@ -65,6 +67,11 @@ __all__ = [
 # built-in project roles are admin/member/viewer/no-access; `viewer` reads
 # secrets and changes nothing.
 DEFAULT_PROJECT_ROLE = "viewer"
+
+# The four Infisical ships. Assigning one of these is not licence-gated;
+# assigning anything else is `rbac`, which is off on an unlicensed instance.
+# Upstream decides the same way, in `isCustomRole`: not built-in means custom.
+BUILTIN_PROJECT_ROLES = frozenset({"admin", "member", "viewer", "no-access"})
 
 # Org-level role given to a group this tool creates. `member` is the weakest
 # role that lets someone belong to the org at all; project access is granted
@@ -118,6 +125,12 @@ class AccessSummary:
     errors: list[str] = field(default_factory=list)
     actions: list[Action] = field(default_factory=list)
 
+    # Work the instance's licence forbids. Kept apart from `errors` on purpose:
+    # a plan restriction is not a failure of the run, it is a gap between the
+    # declaration and the server, and folding it into `errors` would make every
+    # unlicensed run exit non-zero forever with nothing to fix.
+    skipped: list[str] = field(default_factory=list)
+
     def record(self, kind: str, target: str, result: str, detail: str = "") -> None:
         self.actions.append(Action(kind=kind, target=target, result=result, detail=detail))
 
@@ -125,17 +138,25 @@ class AccessSummary:
         self.errors.append(f"{kind} {target}: {detail}")
         self.record(kind, target, "error", detail)
 
+    def skip(self, kind: str, target: str, detail: str) -> None:
+        """Record work the licence forbids. Does not make the run unsuccessful."""
+        self.skipped.append(f"{kind} {target}: {detail}")
+        self.record(kind, target, "unsupported", detail)
+
     @property
     def ok(self) -> bool:
         return not self.errors
 
     def headline(self) -> str:
         verb = "would apply" if self.dry_run else "applied"
-        return (
+        line = (
             f"{verb}: groups +{self.groups_created}, "
             f"project grants +{self.grants_created}, "
             f"errors {len(self.errors)}"
         )
+        if self.skipped:
+            line = f"{line}, unsupported {len(self.skipped)}"
+        return line
 
 
 def group_targets(manifest: Iterable[Mapping[str, Any]]) -> dict[str, set[str]]:
@@ -421,6 +442,7 @@ def sync_access(
     project_role: str = DEFAULT_PROJECT_ROLE,
     org_role: str = DEFAULT_ORG_ROLE,
     database: Database | None = None,
+    plan: Plan | None = None,
     dry_run: bool = False,
 ) -> AccessSummary:
     """Grant every manifest group access to every project it appears in.
@@ -428,6 +450,15 @@ def sync_access(
     ``database`` is the opt-in escape hatch: when it is None, a group the
     manifest names but the instance does not have is recorded as an error
     explaining why, and the run continues with the groups that do exist.
+
+    ``plan`` decides which "why". Without it this function has to assert the
+    instance is unlicensed, which was true of every instance it had met but was
+    never something it checked. With it, a missing group on a *licensed*
+    instance is reported as the real error it is, and a missing group on an
+    unlicensed one is a plan restriction rather than a failure -- so the run
+    can be honest about which of the two it is looking at. Passing None keeps
+    the old behaviour, which is the right default for a caller that could not
+    reach the plan endpoint.
 
     Access is never revoked. A group removed from the manifest keeps whatever
     it had, and that is on purpose: this tool does not know why a human granted
@@ -438,6 +469,25 @@ def sync_access(
     summary = AccessSummary(dry_run=dry_run)
     targets = group_targets(manifest)
     if not targets:
+        return summary
+
+    # A built-in role is ungated; a custom one needs `rbac`. Checking here
+    # rather than letting the grant fail matters because the failure would be
+    # per-grant: N identical 400s, one for every project, none of which say the
+    # role is the problem.
+    if (
+        plan is not None
+        and project_role not in BUILTIN_PROJECT_ROLES
+        and not plan.allows("custom-role")
+    ):
+        summary.fail(
+            "grant",
+            project_role,
+            f"{project_role!r} is not one of the built-in project roles "
+            f"({', '.join(sorted(BUILTIN_PROJECT_ROLES))}), and this instance's "
+            "licence does not permit assigning custom roles. Every grant below "
+            "would be refused, so none were attempted.",
+        )
         return summary
 
     try:
@@ -476,16 +526,48 @@ def sync_access(
             continue
 
         if database is None:
-            summary.fail(
-                "group",
-                name,
+            # Three different situations, and conflating them is what this
+            # whole module-level `plan` argument is for:
+            #
+            #   licensed        -> the API would accept createGroup, so the
+            #                      group is genuinely absent and someone should
+            #                      look. A real error.
+            #   unlicensed      -> the API will refuse forever. Not an error;
+            #                      a gap, reported and survived.
+            #   unknown         -> we could not read the plan. Say so rather
+            #                      than assert either, and keep it an error so
+            #                      it is not quietly tolerated.
+            if plan is not None and plan.allows("create-group"):
+                summary.fail(
+                    "group",
+                    name,
+                    "does not exist. This instance's licence permits group "
+                    "creation, so this is not a plan restriction -- either the "
+                    "group was never created, or the sync identity cannot see "
+                    "it. Create it in the UI, or check the identity's "
+                    "organization role.",
+                )
+                continue
+
+            detail = (
                 "does not exist, and creating one through the API is refused by "
                 "Infisical's plan restriction on self-hosted instances. The UI "
                 "cannot do it either -- it calls the same gated createGroup. "
                 "Re-run with --create-missing-groups and database credentials, "
                 "or drop the group from the manifest if administrator-only "
-                "visibility is acceptable.",
+                "visibility is acceptable."
             )
+            if plan is not None:
+                # Measured, so the advice above is fact rather than inference
+                # and the run has nothing to apologise for.
+                summary.skip("group", name, detail)
+            else:
+                summary.fail(
+                    "group",
+                    name,
+                    f"{detail} (The instance's licence was not read, so this "
+                    "reason is inferred; 'nixfisical license' checks it.)",
+                )
             continue
 
         if dry_run:
