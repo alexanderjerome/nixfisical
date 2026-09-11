@@ -148,6 +148,18 @@
         , url
         , validate ? true
         , adminFile ? "secrets/infisical-admin.yaml"
+          # The age identity to decrypt with, if SOPS_AGE_KEY_FILE is not
+          # already set. Null leaves sops to its own default,
+          # ~/.config/sops/age/keys.txt.
+          #
+          # Worth setting for an estate that keeps a per-repo key, because the
+          # failure it prevents does not look like what it is. Unset, sops
+          # reports a missing keyring and a keyring holding the wrong key
+          # identically -- twenty lines of "Recovery failed because no master
+          # key was able to decrypt the file", which reads like a corrupt file
+          # and means neither. A flake app is run from outside any dev shell by
+          # definition, so it is the likeliest place to meet that.
+        , ageKeyFile ? null
           # Defaults to this flake's own build so a consumer needs neither the
           # overlay nor a matching nixpkgs. Pass `pkgs.nixfisical` if you have it.
         , nixfisical ? self.packages.${pkgs.stdenv.hostPlatform.system}.nixfisical
@@ -173,6 +185,22 @@
                 ;;
             esac
 
+            ${pkgs.lib.optionalString (ageKeyFile != null) ''
+            # `:=` and not `=`: an operator who set SOPS_AGE_KEY_FILE meant it,
+            # and a dev shell that already exports one keeps winning.
+            : "''${SOPS_AGE_KEY_FILE:=${ageKeyFile}}"
+            if [ -f "$SOPS_AGE_KEY_FILE" ]; then
+              export SOPS_AGE_KEY_FILE
+            else
+              # Warn, but do not export and do not exit. SOPS_AGE_KEY and the
+              # ssh-key paths are still live, so an operator with a working
+              # setup that is not this one must not be broken by a default --
+              # and pointing the variable at a file that is not there would
+              # narrow sops' search rather than widen it.
+              echo "infisical-sync: no age identity at $SOPS_AGE_KEY_FILE;" \
+                   "falling back to sops' own search" >&2
+            fi
+            ''}
             # A file rather than a pipe: both subcommands read the manifest, and
             # `-` can only be consumed once.
             manifest=$(mktemp)
@@ -266,6 +294,13 @@
             inherit pkgs;
             nixosConfigurations = { };
             url = "https://infisical.invalid";
+            # Set, because the `ageKeyFile` block is the only conditionally
+            # emitted shell in the app: left at its null default it renders to
+            # the empty string, and a check that builds the app without it is a
+            # check that shellcheck never reads the branch most likely to be
+            # wrong. The value is a shell expression on purpose -- that is the
+            # contract, and this is what exercises it.
+            ageKeyFile = "\${XDG_CONFIG_HOME:-$HOME/.config}/sops/age/keys.txt";
           };
 
           # Evaluate the export module standalone and assert the manifest
