@@ -480,9 +480,11 @@ def sync_access(
                 "group",
                 name,
                 "does not exist, and creating one through the API is refused by "
-                "Infisical's plan restriction on self-hosted instances. Create "
-                "it in the UI, or re-run with --create-missing-groups and "
-                "database credentials.",
+                "Infisical's plan restriction on self-hosted instances. The UI "
+                "cannot do it either -- it calls the same gated createGroup. "
+                "Re-run with --create-missing-groups and database credentials, "
+                "or drop the group from the manifest if administrator-only "
+                "visibility is acceptable.",
             )
             continue
 
