@@ -16,8 +16,10 @@
 # secret the moment this module is imported, which moves the manifest's store
 # path, which moves the host's toplevel. Importing this fleet-wide rebuilds
 # every host that uses sops, annotated or not; changing one annotation
-# afterwards rebuilds that host. Measured, not assumed: on a 17-host fleet the
-# import moved every toplevel except the three hosts with no sops secrets.
+# afterwards rebuilds that host. Measured, not assumed: on a 17-host fleet,
+# evaluating toplevel drvPaths with and without the import on an otherwise
+# identical tree moved hosts that carry sops secrets and zero annotations
+# (caddy, tofu-db) and left a host with no sops secrets alone (pihole).
 #
 # What IS true: sops-nix never *reads* the field. `sops-install-secrets` is Go
 # and ignores unknown JSON keys, and its `-check-mode=sopsfile` validation
