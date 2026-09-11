@@ -162,7 +162,8 @@ in
         `oci` runs the upstream `infisical/infisical` container image. This is
         what upstream supports and what works today.
 
-        `native` runs a Nix-built server (`pkgs.infisical-backend`, from this
+        `native` runs a Nix-built server (`pkgs.infisical-backend`, or
+        `pkgs.infisical-standalone` to get the web UI with it — both from this
         flake's overlay) as a plain systemd unit, with no container runtime.
         It splits the image's conflated entrypoint in two: `infisical.service`
         never migrates, and `infisical-migrate.service` is the only thing that
@@ -187,6 +188,14 @@ in
         It must provide `bin/infisical-server` and `bin/infisical-migrate`.
         Leave it null and add this flake's overlay to get the packaged
         upstream server; set it to pin a different build.
+
+        The default, `pkgs.infisical-backend`, is the API and nothing else:
+        every path outside `/api` answers 404 in JSON, so a browser pointed at
+        it gets no login page. Set this to `pkgs.infisical-standalone` for the
+        build that also serves the web UI. That is the only difference — the
+        UI is a property of the package, not of this module, because the
+        server finds its files at a path relative to its own code and crashes
+        on start if they are not there.
       '';
     };
 

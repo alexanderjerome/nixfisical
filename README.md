@@ -111,7 +111,10 @@ updated, and **deleted**. Run it first.
 | `nixosModules.server` | Runs a self-hosted instance. |
 | `nixosModules.default` | Both of the above. |
 | `packages.nixfisical` | The `nixfisical` CLI. |
-| `overlays.default` | Puts `nixfisical` in your package set. |
+| `packages.infisical-backend` | The Infisical API, built from source. No web UI. |
+| `packages.infisical-frontend` | The Infisical web UI, as static files. |
+| `packages.infisical-standalone` | Both, with the API serving the UI. |
+| `overlays.default` | Puts all four in your package set. |
 
 Wiring the manifest app into a consumer flake:
 
@@ -251,7 +254,23 @@ systemctl start infisical-migrate # after a backup
 systemctl restart infisical
 ```
 
-Bump the pinned release with `nix run .#bump-infisical -- 0.166.0`.
+**The web UI is opt-in.** `package` defaults to `pkgs.infisical-backend`, which
+is the API and nothing else — a browser pointed at it gets `{"statusCode":404}`,
+not a login page. For the UI:
+
+```nix
+services.infisical.package = pkgs.infisical-standalone;
+```
+
+That is the same server with the frontend's static build placed where it looks
+for it, and `STANDALONE_MODE` set by the package's own wrapper. There is no
+module option, because the server crashes on start rather than 404s if the flag
+is set on a build with no UI in it — choosing the package cannot be wrong that
+way. `docs/native.md` has the details.
+
+Bump the pinned release with `nix run .#bump-infisical -- 0.166.0`. It moves
+the release and all three hashes together; the backend and the frontend must
+come from the same tag.
 
 [docs/native.md](docs/native.md) has the packaging details, including why
 upstream's `migration:latest` is three steps rather than the one
@@ -414,9 +433,6 @@ than racing it.
 
 **Folder pruning.** Secrets are pruned; empty folders are left behind.
 
-**The Infisical frontend.** The `native` backend packages the API only. The web
-UI is a separate `buildNpmPackage`; run it from the container if you need it.
-
 ## Roadmap
 
 - Reporting group access that exists on the instance but is not in the
@@ -425,7 +441,6 @@ UI is a separate `buildNpmPackage`; run it from the container if you need it.
 - A NixOS VM test covering bootstrap → sync → prune end to end, and one
   covering the `native` units against a live Postgres — they are currently
   verified by evaluation only.
-- Packaging the frontend, so `native` can serve the web UI too.
 
 ## Prior art
 

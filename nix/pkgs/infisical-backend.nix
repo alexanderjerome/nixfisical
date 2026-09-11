@@ -29,10 +29,8 @@
 # migrations and an operator about to run one wants to see the pending list
 # first. There is no `rollback`; see the usage text for why.
 { lib
-, fetchFromGitHub
 , buildNpmPackage
 , fetchNpmDeps
-, runCommand
 , jq
 , nodejs_22
 , python3
@@ -42,68 +40,30 @@
 , openssl
 , runtimeShell
 , git
+, infisicalSource
 }:
 
 let
   nodejs = nodejs_22;
 
-  # These three are the whole of a version bump, which is why they sit together
-  # at the top rather than next to what uses them. `nix run .#bump-infisical --
-  # <version>` rewrites all three in place; it matches on these exact names, so
-  # keep them one-per-line and literal.
-  version = "0.165.8";
-  srcHash = "sha256-VGaGbV77VuLckTMDf0Gl5Qa7uVmfN9XuJ5mdltRpVF8=";
+  inherit (infisicalSource) version src;
+
+  # Half of a version bump; the other half -- the release and its source hash
+  # -- is in infisical-source.nix, shared with the frontend. `nix run
+  # .#bump-infisical -- <version>` rewrites this in place; it matches on this
+  # exact name, so keep it one line and literal.
   npmDepsHash = "sha256-1AOYW4SQ7y5/ERCYQiyDSpj2zpPS6VeBZFgzFsbigKg=";
-
-  source = fetchFromGitHub {
-    owner = "Infisical";
-    repo = "infisical";
-    rev = "v${version}";
-    hash = srcHash;
-  };
-
-  # `prefetch-npm-deps` fetches every entry in the lockfile; `npm ci` fetches
-  # only those matching the host's os/cpu. That difference is normally
-  # invisible, but Infisical's lockfile pins `@infisical/quic-darwin-arm64`,
-  # `-darwin-x64`, `-darwin-universal` and `-win32-x64` at versions that were
-  # never published -- the registry answers 404 for all four, while the two
-  # linux builds are present. So the prefetch fails on packages the build would
-  # never have installed.
-  #
-  # Dropping every optional entry that excludes linux fixes it. This package is
-  # linux-only, so on the platforms it targets the filter removes exactly what
-  # npm would have skipped by itself.
-  #
-  # It has to be applied in two places: to the lockfile the prefetcher reads,
-  # and to the one in the unpacked source, because `npmConfigHook` refuses to
-  # build when the two differ. Hence one filter defined once -- if these drift
-  # the build fails with a hash mismatch that says nothing about the cause.
-  lockFilter = ''
-    def foreignOptional:
-      (.optional == true) and (has("os")) and ((.os | index("linux")) == null);
-    .packages |= with_entries(select(.value | foreignOptional | not))
-  '';
-
-  npmLock = runCommand "infisical-backend-npm-lock"
-    {
-      nativeBuildInputs = [ jq ];
-    } ''
-    mkdir -p $out
-    cp ${source}/backend/package.json $out/package.json
-    jq ${lib.escapeShellArg lockFilter} \
-      ${source}/backend/package-lock.json > $out/package-lock.json
-  '';
 in
 buildNpmPackage {
   pname = "infisical-backend";
-  inherit version;
+  inherit version src;
 
-  src = source;
-
-  # Upstream is a monorepo; only `backend/` is packaged here. The frontend is
-  # a separate build and the API is useful without it -- nothing in this repo's
-  # CLI touches the web UI.
-  sourceRoot = "${source.name}/backend";
+  # Upstream is a monorepo; only `backend/` is packaged here. The web UI is a
+  # separate build (infisical-frontend.nix) that this package does not need and
+  # does not reference -- the API is useful on its own, and nothing in this
+  # repo's CLI touches the UI. `infisical-standalone` joins the two for anyone
+  # who wants both.
+  sourceRoot = "${src.name}/backend";
 
   # Fetcher v2 caches registry *metadata*, not just tarballs. Infisical's
   # package.json carries nested `overrides` that pin ranges rather than exact
@@ -114,7 +74,7 @@ buildNpmPackage {
   npmDepsFetcherVersion = 2;
 
   npmDeps = fetchNpmDeps {
-    src = npmLock;
+    src = infisicalSource.npmLock "backend";
     fetcherVersion = 2;
     hash = npmDepsHash;
   };
@@ -140,8 +100,7 @@ buildNpmPackage {
   # cannot reach in a sandbox.
   postPatch = ''
     rm -f .npmrc
-    jq ${lib.escapeShellArg lockFilter} package-lock.json > package-lock.json.filtered
-    mv package-lock.json.filtered package-lock.json
+    ${infisicalSource.filterLockInPlace}
   '';
 
   # Oracle Instant Client is not vendored. Upstream's image downloads it from

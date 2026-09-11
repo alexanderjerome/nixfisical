@@ -75,10 +75,63 @@ Each step is load-bearing:
 `rollback` subcommand, for the `down()` reason above — offering one would
 promise an undo that silently does not happen.
 
+## Three packages
+
+| Package                | Is                                               |
+| ---------------------- | ------------------------------------------------ |
+| `infisical-backend`    | the API. No web UI: every path outside `/api` answers 404 in JSON. |
+| `infisical-frontend`   | the web UI, as static files. Nothing serves it.  |
+| `infisical-standalone` | both, arranged so the API serves the UI in-process. |
+
+`services.infisical.package` defaults to `infisical-backend`, so a browser
+pointed at a default native instance gets `{"statusCode":404}` rather than a
+login page. Set the option to `pkgs.infisical-standalone` to get the UI. There
+is no module option for it, and that is on purpose: the server locates the UI's
+files at a path derived from where its *own code* is, and `readFileSync`s
+`index.html` when the plugin registers rather than when a request arrives — so
+a flag saying "serve the UI" on a package that does not carry one is not a 404,
+it is a crashloop. Choosing the package cannot be wrong in that way.
+
+### How the UI is served
+
+There is no separate web server and no `next start`. Infisical's frontend
+(upstream calls the workspace `frontend-v2`) is Vite + React and builds to a
+static `dist/`; the API serves it itself when `STANDALONE_MODE` is set, via
+`@fastify/static` plus a `GET /*` SPA fallback that excludes `/api`. That is
+what upstream's own `Dockerfile.standalone-infisical` does.
+
+The awkward part is *where*. `backend/src/server/app.ts` computes
+
+```js
+dir = path.join(__dirname, "../../")
+```
+
+from the directory of the running `dist/server/app.mjs`, and roots the static
+handler at `<dir>/frontend-build`. No env var, no flag, no way to point it
+elsewhere. So `infisical-standalone` has to put the UI inside the backend's own
+directory layout. Node resolves symlinks before computing `__dirname`, which
+rules out symlinking `dist/` — it would resolve back into `infisical-backend`'s
+store path, which has no `frontend-build`. Hence: `dist/` is a real copy
+(47 MB), `node_modules` stays a symlink (621 MB, and nothing in there computes
+a directory from a file), `frontend-build` is a symlink to the frontend.
+
+`STANDALONE_MODE=true` is set by the standalone package's own wrapper with
+`--set-default`, so it travels with the build that can honour it and an
+operator can still turn it off per-host without switching packages.
+
+The split is not just tidiness. `infisical-backend` is an hour of npm and
+native-addon linking; the UI is a Vite build and a directory of files. Folding
+them into one derivation would mean paying that hour every time either moved.
+
 ## Packaging notes
 
 `nix/pkgs/infisical-backend.nix`, `buildNpmPackage` over `backend/` at a pinned
-`v<version>` tag. Three things about it are non-obvious:
+`v<version>` tag; `infisical-frontend.nix` is the same over `frontend/`. The
+release and its source hash live once in `infisical-source.nix`, because a
+backend and a frontend from different releases is a mismatch nothing else would
+catch — the API would answer and the UI would be subtly wrong.
+
+Four things about the backend are non-obvious:
 
 - **`npmDepsFetcherVersion = 2` is required, not a preference.** Infisical's
   `package.json` has nested `overrides` pinning *ranges* rather than exact
@@ -95,10 +148,35 @@ promise an undo that silently does not happen.
   filter drops every `optional` entry that excludes linux. It must be applied
   to *both* the prefetch lockfile and the one in the unpacked source, because
   `npmConfigHook` refuses to build when they differ; hence one filter defined
-  once in a `let` binding.
+  once, in `infisical-source.nix`. The frontend reuses it — it has no
+  unpublished entries, but it does carry 46 foreign esbuild/rollup/swc/oxide
+  binaries that there is no reason to fetch.
 - **`dist/` is not self-contained.** `tsup` is configured with
   `skipNodeModulesBundle`, so the runtime needs `node_modules` beside it. The
   install prunes to production deps and copies both.
+- **The prune must not get `--legacy-peer-deps`, though the install must.**
+  `npm ci` needs the flag to stop re-resolving the lockfile's ranges. `npm
+  prune` decides what is *reachable* and deletes the rest, and under legacy
+  resolution peer dependencies are reachable from nothing — it removed
+  `express-session`, which nothing declares directly and `connect-redis` only
+  asks for as a peer. The build succeeded and the server died on every start
+  with `ERR_MODULE_NOT_FOUND`. A `postInstallCheck` now walks the pruned tree
+  and asserts every required peer still resolves; it needs `doInstallCheck =
+  true` to run at all, which is not the default.
+
+The frontend has two of its own:
+
+- **Dependencies install with `--ignore-scripts`**, as upstream's Dockerfile
+  does. Every native thing in that tree — esbuild, rollup, `@swc/core`,
+  tailwind's oxide — ships a prebuilt binary per platform, and its install
+  script exists to *download* one when the prebuilt is missing. In a sandbox
+  that is a fetch that cannot happen; with the lockfile's linux binaries
+  present it is a fetch that does not need to.
+- **`INFISICAL_PLATFORM_VERSION` must be set at build time.** `vite.config.ts`
+  stamps it into every asset filename and falls back to the literal `0.0.1`,
+  so without it the bundle claims to be a version that was never released.
+  Both spellings are set, `VITE_`-prefixed and not, because the config reads
+  one then the other and upstream sets both rather than picking.
 
 Oracle Instant Client is deliberately not vendored: upstream's image downloads
 it from `download.oracle.com` under a licence forbidding redistribution, so it
@@ -111,11 +189,17 @@ needs it.
 nix run .#bump-infisical -- 0.166.0
 ```
 
-Rewrites `version`, `srcHash` and `npmDepsHash` in
-`nix/pkgs/infisical-backend.nix`. It resolves each hash by building that
-attribute alone with a placeholder and reading the mismatch, source first —
-`npmDeps` derives from the fetched source, so a wrong `srcHash` would make the
-npm build fail on the source and report the wrong hash.
+Rewrites four values across three files: `version` and `srcHash` in
+`infisical-source.nix`, and a `npmDepsHash` in each of `infisical-backend.nix`
+and `infisical-frontend.nix`. It resolves each hash by building that attribute
+alone with a placeholder and reading the mismatch, source first — `npmDeps`
+derives from the fetched source, so a wrong `srcHash` would make the npm build
+fail on the source and report the wrong hash.
+
+Both npm hashes move together. They come from lockfiles inside the same source
+tarball, so leaving one behind is not a stale-but-working pin; it is a mismatch
+against a tarball that no longer contains what the hash was taken from, and the
+error says nothing about a bump being the reason.
 
 It does not build, test or commit. Read upstream's release notes for new
 migrations before deploying.
@@ -145,8 +229,12 @@ was worth reading and is not worth depending on — checked 2026-09-09:
 
 ## Still missing
 
-- **The frontend.** Same `buildNpmPackage` treatment, its own deps hash. The
-  API is useful without it and this repo's CLI never touches the web UI, so it
-  has not been done.
-- **A NixOS VM test.** The units are verified by evaluation only. Nothing here
-  has yet been run against a live Postgres.
+- **A NixOS VM test.** The units are verified by evaluation only, and the
+  standalone package's join — a real `dist/`, a symlinked `node_modules`, a
+  symlinked `frontend-build` — is verified by `test -f` at build time and by
+  one host in one fleet at run time. A VM test that boots the server against a
+  live Postgres and asserts `GET /` returns HTML is the thing that would catch
+  upstream moving `dir` out from under it.
+- **`CDN_HOST` and the CSP rewriting.** `serve-ui.ts` will rewrite asset URLs
+  and Content-Security-Policy directives when `CDN_HOST` is set. Nothing here
+  exposes that; `extraEnvironment` reaches it if you need it.

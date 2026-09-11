@@ -25,13 +25,31 @@
         export = ./nix/modules/export.nix;
       };
 
-      overlays.default = final: prev: {
-        nixfisical = final.callPackage ./nix/pkgs/nixfisical.nix { };
-        infisical-backend = final.callPackage ./nix/pkgs/infisical-backend.nix { };
-        # `bump-infisical` is deliberately absent: it rewrites this repo's own
-        # source and is only meaningful from a checkout, so it is a flake app
-        # rather than something a consumer's nixpkgs should carry.
-      };
+      overlays.default = final: prev:
+        let
+          # Not exposed as an attribute: it is a version pin and two helper
+          # strings, not a package, and a consumer's nixpkgs has no use for it.
+          infisicalSource = final.callPackage ./nix/pkgs/infisical-source.nix { };
+        in
+        {
+          nixfisical = final.callPackage ./nix/pkgs/nixfisical.nix { };
+
+          # The API, the web UI, and the two joined so the API serves the UI.
+          # Separate because the API is useful alone and the UI is cheap to
+          # rebuild while the API is not -- see infisical-standalone.nix.
+          infisical-backend = final.callPackage ./nix/pkgs/infisical-backend.nix {
+            inherit infisicalSource;
+          };
+          infisical-frontend = final.callPackage ./nix/pkgs/infisical-frontend.nix {
+            inherit infisicalSource;
+          };
+          infisical-standalone = final.callPackage ./nix/pkgs/infisical-standalone.nix {
+            inherit infisicalSource;
+          };
+          # `bump-infisical` is deliberately absent: it rewrites this repo's own
+          # source and is only meaningful from a checkout, so it is a flake app
+          # rather than something a consumer's nixpkgs should carry.
+        };
 
       # Render a fleet's manifest as a flake app:
       #
@@ -84,12 +102,22 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
         nixfisical = pkgs.callPackage ./nix/pkgs/nixfisical.nix { };
-        infisical-backend = pkgs.callPackage ./nix/pkgs/infisical-backend.nix { };
+        infisicalSource = pkgs.callPackage ./nix/pkgs/infisical-source.nix { };
+        infisical-backend = pkgs.callPackage ./nix/pkgs/infisical-backend.nix {
+          inherit infisicalSource;
+        };
+        infisical-frontend = pkgs.callPackage ./nix/pkgs/infisical-frontend.nix {
+          inherit infisicalSource;
+        };
+        infisical-standalone = pkgs.callPackage ./nix/pkgs/infisical-standalone.nix {
+          inherit infisicalSource infisical-backend infisical-frontend;
+        };
         bump-infisical = pkgs.callPackage ./nix/pkgs/bump-infisical.nix { };
       in
       {
         packages = {
-          inherit nixfisical infisical-backend bump-infisical;
+          inherit nixfisical bump-infisical
+            infisical-backend infisical-frontend infisical-standalone;
           default = nixfisical;
         };
 
