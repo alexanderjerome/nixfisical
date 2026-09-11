@@ -4,6 +4,7 @@ Commands map onto the jobs described in the package docstring:
 
     nixfisical bootstrap   one-time instance initialisation
     nixfisical adopt       same end state, for an instance already initialised
+    nixfisical add-org     same end state, for an additional organization
     nixfisical sync        converge the instance onto a manifest
     nixfisical sync-access grant manifest groups project access
     nixfisical validate    check a manifest, offline
@@ -32,6 +33,13 @@ and not yet initialised.
 same admin file, and which one applies is decided by whether the instance has
 ever been initialised -- a thing that cannot be undone. ``adopt`` is the
 one-way door out of "someone clicked through the setup wizard".
+
+``add-org`` is neither's alternative: it runs after whichever of the two
+applied, once per additional organization, and writes a *separate* admin file
+that the other commands take with ``--admin-file``. Organizations are the
+instance's hard partition -- a token scoped to one sees nothing of another,
+whether the route says so with a 403 or with an empty list -- so this is how
+two estates share a server without sharing a blast radius.
 """
 
 from __future__ import annotations
@@ -55,9 +63,11 @@ from nixfisical.access import (
 )
 from nixfisical.api import InfisicalClient, InfisicalError
 from nixfisical.bootstrap import (
+    DEFAULT_ADD_ORG_COMMIT_MESSAGE,
     DEFAULT_ADOPT_COMMIT_MESSAGE,
     DEFAULT_COMMIT_MESSAGE,
     BootstrapError,
+    add_org as run_add_org,
     adopt as run_adopt,
     bootstrap as run_bootstrap,
     read_organization_id,
@@ -432,6 +442,197 @@ def adopt_command(
         "  the superadmin password you supplied is now recorded in the admin "
         "file. Rotate it if it is also a human's login.",
         fg="yellow",
+    )
+    if git_commit and not result.committed:
+        click.secho("  admin file was not committed; see the messages above.", fg="yellow")
+
+
+# --------------------------------------------------------------------------
+# add-org
+#
+# Takes TWO admin files, which is the one thing about this command that needs
+# saying twice. The global --admin-file is the instance's, and it is read: the
+# superadmin password lives there and creating an organization needs a human.
+# --org-admin-file is the one being written, for the new organization, and it
+# is what `sync --admin-file <that>` will use from then on.
+# --------------------------------------------------------------------------
+
+
+@cli.command("add-org")
+@click.option(
+    "--organization",
+    required=True,
+    help="Name of the organization. Matched against existing ones by id, slug "
+    "or name first, and only created if nothing matches -- so re-running is "
+    "safe even though Infisical would happily make a same-named twin.",
+)
+@click.option(
+    "--org-admin-file",
+    required=True,
+    type=click.Path(path_type=Path),
+    help="Where to write the new organization's admin file. Must not exist "
+    "unless its identity already works, in which case this is a no-op.",
+)
+@click.option(
+    "--admin-email",
+    default=None,
+    help="Superadmin email as a literal. Defaults to the one recorded in "
+    "--admin-file.",
+)
+@click.option(
+    "--admin-email-from",
+    default=None,
+    metavar="FILE:KEY|KEY",
+    help="Read the superadmin email from SOPS instead of --admin-file.",
+)
+@click.option(
+    "--admin-password-from",
+    default=None,
+    metavar="FILE:KEY|KEY",
+    help="Read the superadmin password from SOPS instead of --admin-file. "
+    "Only needed for an instance whose superadmin is a human account; a "
+    "bootstrapped instance's password exists nowhere but --admin-file.",
+)
+@click.option(
+    "--secrets-file",
+    default=None,
+    type=click.Path(path_type=Path),
+    help="Default SOPS file for bare-KEY forms of the two options above.",
+)
+@click.option(
+    "--record-admin-credentials",
+    is_flag=True,
+    default=False,
+    help="Also write the superadmin block into the new file. Off by default: "
+    "that password is scoped to the whole instance, not to this organization, "
+    "so copying it into another estate's repo would hand its holders every "
+    "other organization too. Turn it on when the new organization is another "
+    "slice of the same estate.",
+)
+@click.option(
+    "--identity-name",
+    default="fleet-sync",
+    show_default=True,
+    help="Name of the Universal-Auth machine identity to create.",
+)
+@click.option(
+    "--token-ttl",
+    default=2592000,
+    show_default=True,
+    type=int,
+    help="accessTokenTTL and accessTokenMaxTTL for the machine identity, in seconds.",
+)
+@click.option(
+    "--client-secret-description",
+    default="nixfisical sync identity",
+    show_default=True,
+    help="Description recorded on the minted client secret.",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Proceed even though an existing org admin file's credentials cannot "
+    "log in. The existing file is still never overwritten -- move it aside first.",
+)
+@click.option(
+    "--git-commit",
+    is_flag=True,
+    default=False,
+    help="git add + git commit the encrypted admin file in its own repo. Never pushes.",
+)
+@click.option(
+    "--commit-message",
+    default=DEFAULT_ADD_ORG_COMMIT_MESSAGE,
+    show_default=True,
+    help="Commit message used by --git-commit.",
+)
+@click.pass_context
+def add_org_command(
+    ctx: click.Context,
+    organization: str,
+    org_admin_file: Path,
+    admin_email: str | None,
+    admin_email_from: str | None,
+    admin_password_from: str | None,
+    secrets_file: Path | None,
+    record_admin_credentials: bool,
+    identity_name: str,
+    token_ttl: int,
+    client_secret_description: str,
+    force: bool,
+    git_commit: bool,
+    commit_message: str,
+) -> None:
+    """Add another organization to an instance, with its own sync identity.
+
+    One instance can host several organizations, and they are hard partitions:
+    an access token is scoped to exactly one, and asking it about another gets
+    nothing back -- a 403 on some routes, an empty list on others. That makes
+    an organization the right boundary between two estates sharing a server.
+
+    Run this after bootstrap or adopt, once per extra organization. It creates
+    the organization if it is not already there, mints a machine identity in
+    it, and writes a second admin file -- which every other command then takes
+    with --admin-file:
+
+        nixfisical --admin-file secrets/infisical-admin-other.yaml sync ...
+
+    Safe to re-run: an existing organization is reused rather than duplicated,
+    and an org admin file whose identity can log in is verified and left alone.
+    """
+    admin_file: Path = ctx.obj["admin_file"]
+    with _client(ctx) as client:
+        try:
+            result = run_add_org(
+                client,
+                org_admin_file=org_admin_file,
+                organization=organization,
+                instance_admin_file=admin_file,
+                email=admin_email,
+                email_ref=admin_email_from,
+                password_ref=admin_password_from,
+                secrets_file=secrets_file,
+                record_admin_credentials=record_admin_credentials,
+                identity_name=identity_name,
+                token_ttl=token_ttl,
+                client_secret_description=client_secret_description,
+                force=force,
+                git_commit=git_commit,
+                commit_message=commit_message,
+            )
+        except BootstrapError as exc:
+            _fail(str(exc), EXIT_VALIDATION)
+            return
+        except (InfisicalError, SopsError, OSError) as exc:
+            _fail(str(exc))
+            return
+
+    for message in result.messages:
+        click.echo(f"  {message}")
+
+    if result.status == "ok":
+        click.secho(
+            f"already added: {result.admin_file} verified against {ctx.obj['url']}",
+            fg="green",
+        )
+        return
+
+    click.secho(
+        ("created" if result.organization_created else "joined")
+        + f" organization on {ctx.obj['url']}",
+        fg="green",
+    )
+    click.echo(f"  organization : {result.organization_name} ({result.organization_slug})")
+    click.echo(f"  identity     : {identity_name} [{result.identity_id}]")
+    click.echo(f"  admin file   : {result.admin_file}")
+    if not record_admin_credentials:
+        click.echo(
+            "  this file holds no superadmin credentials by design; the "
+            "instance admin file is still the only copy."
+        )
+    click.echo(
+        f"  use it with: nixfisical --admin-file {result.admin_file} sync ..."
     )
     if git_commit and not result.committed:
         click.secho("  admin file was not committed; see the messages above.", fg="yellow")

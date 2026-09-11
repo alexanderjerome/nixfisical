@@ -42,6 +42,28 @@ The asymmetry worth knowing: bootstrap *generates* the superadmin password and
 the admin file is its only copy, so it is never typed and never reused. Adopt
 must be *given* the password of an account a human already logs in with, and
 records it. Rotating it afterwards is the operator's call.
+
+:func:`add_org` is the third entry point, and unlike the first two it is not an
+alternative -- it runs *after* one of them, as many times as there are extra
+organizations. One instance can host several, and an access token is scoped to
+exactly one of them, which makes an organization the natural boundary between
+two estates sharing one server. Neither of the other commands can produce one:
+bootstrap creates the first and is then spent forever, adopt only finds
+organizations that already exist.
+
+How the boundary is enforced varies by route, which is worth knowing before
+debugging one. Measured against v0.165.8 with two identities and one org id:
+``GET /api/v1/identities`` answers 403 naming both organizations, while
+``GET /api/v2/organizations/{id}/workspaces`` answers 200 with an empty list.
+Both refuse; only one says so. So an unexpectedly empty project list is the
+symptom of the wrong admin file, not of an empty organization.
+
+Its admin file is deliberately *not* quite the same file. It carries the
+organization and the machine identity but, by default, no superadmin block --
+because the whole point of a second organization is usually that different
+people own it, and the superadmin is scoped to the instance rather than to any
+one organization. Nothing downstream notices: ``sync``, ``sync-access`` and
+``status`` read only the identity and the organization id.
 """
 
 from __future__ import annotations
@@ -64,20 +86,26 @@ __all__ = [
     "AdminCredentials",
     "bootstrap",
     "adopt",
+    "add_org",
     "read_sync_credentials",
     "read_organization_id",
+    "read_admin_credentials",
     "split_file_key",
     "DEFAULT_COMMIT_MESSAGE",
     "DEFAULT_ADOPT_COMMIT_MESSAGE",
+    "DEFAULT_ADD_ORG_COMMIT_MESSAGE",
 ]
 
 DEFAULT_COMMIT_MESSAGE = "chore(infisical): bootstrap admin credentials"
 DEFAULT_ADOPT_COMMIT_MESSAGE = "chore(infisical): adopt admin credentials"
+DEFAULT_ADD_ORG_COMMIT_MESSAGE = "chore(infisical): add organization credentials"
 
 # Key paths inside the admin file, in manifest ("a/b") notation.
 _KEY_CLIENT_ID = "sync_identity/client_id"
 _KEY_CLIENT_SECRET = "sync_identity/client_secret"
 _KEY_ORG_ID = "organization/id"
+_KEY_ADMIN_EMAIL = "admin/email"
+_KEY_ADMIN_PASSWORD = "admin/password"
 
 
 class BootstrapError(RuntimeError):
@@ -107,8 +135,13 @@ class BootstrapResult:
 
     ``status`` is ``"ok"`` when the admin file already proved itself against the
     instance and there was nothing to do, ``"bootstrapped"`` when we initialised
-    the instance, and ``"adopted"`` when we minted the sync identity against an
-    instance that was already initialised.
+    the instance, ``"adopted"`` when we minted the sync identity against an
+    instance that was already initialised, and ``"added"`` when we minted one
+    against an additional organization on an instance already under management.
+
+    ``organization_created`` distinguishes the two halves of ``"added"``: the
+    organization was made by this run, or it was already there and only the
+    identity is new.
     """
 
     status: str
@@ -119,6 +152,7 @@ class BootstrapResult:
     identity_id: str | None = None
     client_id: str | None = None
     password_generated: bool = False
+    organization_created: bool = False
     committed: bool = False
     messages: list[str] = field(default_factory=list)
 
@@ -148,6 +182,26 @@ def read_organization_id(admin_file: Path) -> str:
     file because that is where bootstrap recorded it.
     """
     return extract(admin_file, sops_key_expr(_KEY_ORG_ID))
+
+
+def read_admin_credentials(admin_file: Path) -> AdminCredentials:
+    """Extract the superadmin login recorded by ``bootstrap`` or ``adopt``.
+
+    The only reader of the ``admin`` block. Everything else in this tool
+    authenticates as the machine identity, which is why that block is written
+    once and never looked at again -- but ``add-org`` genuinely needs a human
+    superadmin, because creating an organization is not something a machine
+    identity scoped to a *different* organization is allowed to do.
+
+    Reading it from here rather than making the operator pass
+    ``--admin-password-from`` matters for the bootstrap case specifically: that
+    password was generated, this file is its only copy, and nobody has it to
+    type.
+    """
+    return AdminCredentials(
+        email=extract(admin_file, sops_key_expr(_KEY_ADMIN_EMAIL)),
+        password=extract(admin_file, sops_key_expr(_KEY_ADMIN_PASSWORD)),
+    )
 
 
 def _verify_existing(
@@ -305,20 +359,29 @@ def resolve_admin_credentials(
 
 def build_admin_document(
     *,
-    credentials: AdminCredentials,
+    credentials: AdminCredentials | None,
     user_id: str,
     organization: dict[str, Any],
     identity_id: str,
     client_id: str,
     client_secret: str,
 ) -> dict[str, Any]:
-    """Assemble the admin-file document. Shape is fixed by the Ansible role."""
-    return {
-        "admin": {
-            "email": credentials.email,
-            "password": credentials.password,
-            "user_id": user_id,
-        },
+    """Assemble the admin-file document. Shape is fixed by the Ansible role.
+
+    ``credentials=None`` omits the ``admin`` block entirely, producing a file
+    that names an organization and the machine identity for it and nothing
+    else. That is a complete file for everything except ``add-org``: nothing
+    else in this tool ever reads ``admin``, so an org file without it can still
+    drive ``sync``, ``sync-access`` and ``status``.
+
+    The reason to omit it is that a second organization usually belongs to a
+    different estate, with a different set of people and a different set of
+    SOPS recipients. Copying the instance superadmin's password into that
+    estate's repo would hand whoever can decrypt it the whole instance --
+    including every other organization on it. The identity in the file is
+    scoped to one organization; the superadmin is not.
+    """
+    document: dict[str, Any] = {
         "organization": {
             "id": organization.get("id", ""),
             "name": organization.get("name", ""),
@@ -330,6 +393,13 @@ def build_admin_document(
             "client_secret": client_secret,
         },
     }
+    if credentials is not None:
+        document["admin"] = {
+            "email": credentials.email,
+            "password": credentials.password,
+            "user_id": user_id,
+        }
+    return document
 
 
 def write_admin_file(path: Path, document: dict[str, Any]) -> None:
@@ -574,18 +644,7 @@ def adopt(
 
     user_id = client.current_user().get("id", "")
 
-    existing = client.list_identities(org["id"])
-    if identity_name in existing:
-        raise BootstrapError(
-            f"organization {org.get('name')!r} already has a machine identity "
-            f"named {identity_name!r}.\n"
-            "Refusing to create a second one with the same name. Its client "
-            "secret cannot be read back out of Infisical -- secrets are shown "
-            "once, at creation -- so there is no way to adopt the existing "
-            "identity into an admin file.\n"
-            "Either delete it in the UI and re-run, or pass --identity-name to "
-            "mint a differently named one alongside it."
-        )
+    _refuse_duplicate_identity(client, org, identity_name)
 
     return _mint_sync_identity(
         client,
@@ -600,6 +659,170 @@ def adopt(
         git_commit=git_commit,
         commit_message=commit_message,
         messages=messages,
+    )
+
+
+def add_org(
+    client: InfisicalClient,
+    *,
+    org_admin_file: Path,
+    organization: str,
+    instance_admin_file: Path | None = None,
+    email: str | None = None,
+    email_ref: str | None = None,
+    password_ref: str | None = None,
+    secrets_file: Path | None = None,
+    record_admin_credentials: bool = False,
+    identity_name: str = "fleet-sync",
+    token_ttl: int = 2592000,
+    client_secret_description: str = "nixfisical sync identity",
+    force: bool = False,
+    git_commit: bool = False,
+    commit_message: str = DEFAULT_ADD_ORG_COMMIT_MESSAGE,
+) -> BootstrapResult:
+    """Add a second (third, nth) organization to an instance we already manage.
+
+    One Infisical instance can host several organizations, and they are hard
+    partitions: an access token is scoped to exactly one, and asking it about
+    another gets nothing back. That is the useful property. Two estates can
+    share one instance without either one's machine identity being able to
+    enumerate, let alone read, the other's projects.
+
+    Measured, because "hard partition" is a security claim: the same
+    organization id answers two projects to the identity that owns it and an
+    empty list to the one that does not. How the refusal is *phrased* varies by
+    route -- ``GET /api/v1/identities`` says 403 and names both organizations,
+    ``GET /api/v2/organizations/{id}/workspaces`` says 200 and an empty list --
+    so an unexpectedly empty project list means the wrong admin file, not an
+    empty organization.
+
+    So this is the third way to reach the same end state as :func:`bootstrap`
+    and :func:`adopt` -- an organization with a ``fleet-sync`` identity and an
+    encrypted file naming both -- for the case they cannot cover. ``bootstrap``
+    is spent after the first run and ``adopt`` only finds organizations that
+    already exist; neither creates one.
+
+    Two things make it safe to re-run, and both matter:
+
+    * the organization is looked up by id, slug or name before it is created,
+      so a second run finds the first run's work instead of creating a
+      same-named twin (Infisical does not enforce unique names);
+    * the org admin file gates the whole thing exactly as it does for the other
+      two commands -- if its identity can log in, there is nothing to do.
+
+    The superadmin login comes from ``instance_admin_file`` by default, because
+    for a bootstrapped instance the generated password lives nowhere else.
+    ``email``/``email_ref``/``password_ref`` override that for an instance whose
+    superadmin is a human account.
+
+    By default the file this writes carries no superadmin credentials -- see
+    :func:`build_admin_document` for why. ``record_admin_credentials`` opts back
+    in, for the case where the new organization is another slice of the *same*
+    estate and the split buys nothing.
+    """
+    org_admin_file = Path(org_admin_file).expanduser()
+    messages: list[str] = []
+
+    already = _admin_file_gate(
+        client, org_admin_file, force=force, what="add the organization", messages=messages
+    )
+    if already is not None:
+        return already
+
+    if email or email_ref or password_ref:
+        credentials = resolve_admin_credentials(
+            email=email,
+            email_ref=email_ref,
+            password_ref=password_ref,
+            secrets_file=secrets_file,
+            require_password=True,
+        )
+    elif instance_admin_file is not None and Path(instance_admin_file).exists():
+        credentials = read_admin_credentials(Path(instance_admin_file).expanduser())
+        messages.append(
+            f"read the superadmin login from {instance_admin_file}"
+        )
+    else:
+        raise BootstrapError(
+            "no superadmin credentials: the instance admin file "
+            f"{instance_admin_file} does not exist, and no --admin-email / "
+            "--admin-password-from was given.\n"
+            "add-org has to act as a human superadmin -- a machine identity is "
+            "scoped to one organization and cannot create another."
+        )
+
+    client.login(email=credentials.email, password=credentials.password)
+
+    organizations = client.list_organizations()
+    org = match_organization(organizations, organization)
+    created = org is None
+    if org is None:
+        org = client.create_organization(organization)
+        messages.append(
+            f"created organization {org.get('name')!r} (slug {org.get('slug')!r})"
+        )
+    else:
+        messages.append(
+            f"organization {org.get('name')!r} already exists (slug "
+            f"{org.get('slug')!r}); minting the identity only"
+        )
+
+    # Re-login before selecting, when we just created the organization. The
+    # token in hand was issued before the enrolment that creation performed,
+    # and whether select-organization re-reads membership or trusts the token's
+    # claims is not something we established -- so this is one cheap request
+    # bought instead of an assumption. The already-exists path needs nothing:
+    # that token was issued after the membership, and the probe that designed
+    # this command selected an existing organization on exactly such a token.
+    if created:
+        client.login(email=credentials.email, password=credentials.password)
+    client.select_organization(org["id"])
+
+    user_id = client.current_user().get("id", "")
+
+    _refuse_duplicate_identity(client, org, identity_name)
+
+    return _mint_sync_identity(
+        client,
+        status="added",
+        admin_file=org_admin_file,
+        credentials=credentials if record_admin_credentials else None,
+        user_id=user_id,
+        organization=org,
+        identity_name=identity_name,
+        token_ttl=token_ttl,
+        client_secret_description=client_secret_description,
+        git_commit=git_commit,
+        commit_message=commit_message,
+        messages=messages,
+        organization_created=created,
+    )
+
+
+def _refuse_duplicate_identity(
+    client: InfisicalClient, organization: dict[str, Any], identity_name: str
+) -> None:
+    """Stop before minting a second identity with a name already in use.
+
+    Infisical does not require identity names to be unique, so this is a
+    nicety rather than a constraint it would enforce -- but a duplicate here is
+    always a mistake. The client secret of the existing one cannot be read back
+    (Infisical shows a secret once, at creation), so if the admin file naming it
+    is gone, the identity is unusable and a second one with the same name just
+    makes the wreckage ambiguous.
+    """
+    existing = client.list_identities(organization["id"])
+    if identity_name not in existing:
+        return
+    raise BootstrapError(
+        f"organization {organization.get('name')!r} already has a machine "
+        f"identity named {identity_name!r}.\n"
+        "Refusing to create a second one with the same name. Its client "
+        "secret cannot be read back out of Infisical -- secrets are shown "
+        "once, at creation -- so there is no way to adopt the existing "
+        "identity into an admin file.\n"
+        "Either delete it in the UI and re-run, or pass --identity-name to "
+        "mint a differently named one alongside it."
     )
 
 
@@ -625,13 +848,10 @@ def _select_organization(
 
     if wanted is None:
         if len(organizations) > 1:
-            choices = ", ".join(
-                f"{org.get('name')!r} (slug {org.get('slug')!r})"
-                for org in organizations
-            )
             raise BootstrapError(
                 f"the superadmin belongs to {len(organizations)} organizations; "
-                f"pass --organization to say which: {choices}"
+                f"pass --organization to say which: "
+                f"{describe_organizations(organizations)}"
             )
         org = organizations[0]
         messages.append(
@@ -639,19 +859,41 @@ def _select_organization(
         )
         return org
 
-    # id, then slug, then name: most specific first, and a name is the only one
-    # of the three a user can change after the fact.
+    org = match_organization(organizations, wanted)
+    if org is not None:
+        return org
+
+    raise BootstrapError(
+        f"no organization matched {wanted!r} by id, slug or name. "
+        f"Available: {describe_organizations(organizations)}"
+    )
+
+
+def match_organization(
+    organizations: list[dict[str, Any]], wanted: str
+) -> dict[str, Any] | None:
+    """Find an organization by id, slug or name, or ``None``.
+
+    Most specific first, and a name is the only one of the three a user can
+    change after the fact -- so an id that happens to equal another org's name
+    resolves the way the operator meant.
+
+    Shared with :func:`add_org`, where a miss is not an error but the signal to
+    create. That sharing is the point: ``add-org --organization X`` re-run after
+    it created X must *find* X by exactly the rule ``adopt`` would have used,
+    or it would create a second organization with the same name every time.
+    """
     for field_name in ("id", "slug", "name"):
         for org in organizations:
             if org.get(field_name) == wanted:
                 return org
+    return None
 
-    choices = ", ".join(
+
+def describe_organizations(organizations: list[dict[str, Any]]) -> str:
+    """Render an organization list for an error message."""
+    return ", ".join(
         f"{org.get('name')!r} (slug {org.get('slug')!r})" for org in organizations
-    )
-    raise BootstrapError(
-        f"no organization matched {wanted!r} by id, slug or name. "
-        f"Available: {choices}"
     )
 
 
@@ -660,7 +902,7 @@ def _mint_sync_identity(
     *,
     status: str,
     admin_file: Path,
-    credentials: AdminCredentials,
+    credentials: AdminCredentials | None,
     user_id: str,
     organization: dict[str, Any],
     identity_name: str,
@@ -669,14 +911,18 @@ def _mint_sync_identity(
     git_commit: bool,
     commit_message: str,
     messages: list[str],
+    organization_created: bool = False,
 ) -> BootstrapResult:
     """Create the sync identity and record everything in the admin file.
 
-    The shared tail of :func:`bootstrap` and :func:`adopt`. It is factored out
-    rather than duplicated because the two commands have to produce admin files
-    that are indistinguishable -- everything downstream (``sync``,
+    The shared tail of :func:`bootstrap`, :func:`adopt` and :func:`add_org`.
+    It is factored out rather than duplicated because all three have to produce
+    admin files that are indistinguishable -- everything downstream (``sync``,
     ``sync-access``, the ``secrets`` group) reads one file format and does not
     care which command wrote it.
+
+    ``credentials=None`` (only ``add_org`` passes it) omits the ``admin`` block;
+    see :func:`build_admin_document`.
     """
     organization_id = organization["id"]
 
@@ -712,7 +958,8 @@ def _mint_sync_identity(
         organization_slug=organization.get("slug"),
         identity_id=identity_id,
         client_id=client_id,
-        password_generated=credentials.generated,
+        password_generated=credentials.generated if credentials else False,
+        organization_created=organization_created,
         committed=committed,
         messages=messages,
     )

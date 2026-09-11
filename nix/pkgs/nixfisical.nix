@@ -36,14 +36,21 @@ python3Packages.buildPythonApplication rec {
 
   nativeBuildInputs = [ makeWrapper ];
 
+  # The suite is deliberately offline-only: no server, no SOPS key, no network.
+  # It covers the handful of pure functions whose failure mode is silent rather
+  # than loud — an admin block landing in the wrong estate's file, a find rule
+  # drifting from the create rule and minting a duplicate organization on every
+  # run. Anything needing a live instance is not a check, it is an operation.
+  nativeCheckInputs = [ python3Packages.pytestCheckHook ];
+
   postFixup = ''
     wrapProgram $out/bin/nixfisical \
       --prefix PATH : ${lib.makeBinPath [ sops git ]}
   '';
 
-  # No test suite yet; the import check catches the usual packaging mistakes
-  # (missing module in the wheel, a dependency declared in pyproject but not
-  # in `dependencies` above).
+  # The import check is still worth its keep alongside the tests: it catches
+  # the packaging mistakes the tests cannot see, because the tests import a
+  # module or two and a missing one elsewhere in the wheel stays missing.
   pythonImportsCheck = [
     "nixfisical"
     "nixfisical.access"

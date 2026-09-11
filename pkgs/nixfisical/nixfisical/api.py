@@ -293,12 +293,13 @@ class InfisicalClient:
         )
         return payload
 
-    # -- superadmin login (adopt only) -------------------------------------
+    # -- superadmin login (adopt and add-org only) -------------------------
     #
     # Everything else in this module authenticates as a machine identity. These
-    # three exist for one job: `nixfisical adopt`, which has to act as a human
-    # superadmin exactly long enough to mint the machine identity that replaces
-    # it. Nothing on the sync path calls them.
+    # exist for two jobs -- `nixfisical adopt` and `nixfisical add-org` -- both
+    # of which have to act as a human superadmin exactly long enough to mint
+    # the machine identity that replaces it. Nothing on the sync path calls
+    # them.
     #
     # Logging in as a user is two requests, not one. `/auth/login` issues a
     # token with no organization attached, and `verifyAuth` defaults to
@@ -378,6 +379,38 @@ class InfisicalClient:
         )
         organizations = payload.get("organizations") or []
         return [org for org in organizations if org.get("id")]
+
+    def create_organization(self, name: str) -> dict[str, Any]:
+        """Create an organization and return its record.
+
+        Accepts the org-less token from :meth:`login` -- necessarily, since
+        this is a route you must be able to reach before belonging to any
+        organization.
+
+        Worth stating explicitly because the neighbouring case is the opposite:
+        organization creation is **not** gated behind an enterprise plan the
+        way group creation is. Verified against v0.165.8, which answers 200
+        here while answering 400 "Failed to create group due to plan
+        restriction" to ``POST /api/v1/groups``. So ``add-org`` needs none of
+        the direct-to-Postgres machinery in :mod:`nixfisical.access`.
+
+        The caller is enrolled as a member, so the new organization shows up in
+        the next :meth:`list_organizations` and :meth:`select_organization`
+        accepts its id. The slug is derived from the name by the server, with a
+        random suffix for uniqueness, and cannot be chosen here.
+        """
+        _, payload = self._request(
+            "POST",
+            "/api/v2/organizations",
+            json={"name": name},
+            description=f"create organization {name!r}",
+        )
+        organization = payload.get("organization") or {}
+        if not organization.get("id"):
+            raise InfisicalError(
+                f"create organization {name!r} returned no organization id"
+            )
+        return organization
 
     def current_user(self) -> dict[str, Any]:
         """Return the logged-in user record. Used for the admin file's user id."""

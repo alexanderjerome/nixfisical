@@ -304,6 +304,7 @@ which claims the same path, the two will conflict — pick one.
 ```
 nixfisical bootstrap     initialise a fresh instance, record creds in SOPS
 nixfisical adopt         same, for an instance that is already initialised
+nixfisical add-org       same end state, for an additional organization
 nixfisical sync          converge the instance onto a manifest
 nixfisical sync-access   grant manifest groups access to their projects
 nixfisical validate      check a manifest offline (exit 2 on problems)
@@ -373,6 +374,72 @@ file happens to exist locally. Those are independent facts, and the case where
 they disagree — initialised instance, no admin file — is exactly the one
 `adopt` exists for, so it is the one worth naming rather than mislabelling as
 "not bootstrapped yet".
+
+### A second organization on one instance
+
+`bootstrap` creates the first organization and is then spent forever; `adopt`
+only finds organizations that already exist. Neither can give you a second one,
+and a second one is what you want when two estates share a server: an access
+token is scoped to exactly one organization, so the organization — not the
+project — is the blast radius.
+
+That partition is worth stating as measured rather than assumed. Against
+v0.165.8, with two machine identities and one organization id: the identity
+that owns it lists its two projects, the identity that does not lists none.
+How the refusal is *phrased* varies by route — `GET /api/v1/identities`
+answers 403 and names both organizations, `GET /api/v2/organizations/{id}/workspaces`
+answers 200 and an empty list. Both refuse; only one says so. So an
+unexpectedly empty project list means the wrong admin file, not an empty
+organization.
+
+`add-org` runs after whichever of `bootstrap`/`adopt` applied, once per extra
+organization. It takes **two** admin files, which is the only genuinely
+confusing thing about it: the global `--admin-file` is the instance's and is
+*read* (creating an organization needs a human superadmin, and for a
+bootstrapped instance that generated password's only copy is in there);
+`--org-admin-file` is the new one being *written*.
+
+```sh
+nixfisical --url https://infisical.example.com \
+  --admin-file secrets/infisical-admin.yaml \
+  add-org --organization 'XG Capital Strategies' \
+          --org-admin-file secrets/infisical-admin-xgcs.yaml \
+          --git-commit
+```
+
+From then on, that file is the one every other command takes:
+
+```sh
+nixfisical --admin-file secrets/infisical-admin-xgcs.yaml sync --manifest ...
+```
+
+Unlike group creation, organization creation is **not** plan-gated. The
+free-tier instance answers 200 to `POST /api/v2/organizations` while answering
+400 "Failed to create group due to plan restriction" to `POST /api/v1/groups`,
+so `add-org` needs none of the direct-to-Postgres machinery that
+`--create-missing-groups` does.
+
+Two things worth knowing about the file it writes:
+
+- **It carries no superadmin block by default.** That block is write-only in
+  this tool — `bootstrap` and `adopt` write it, and nothing on the `sync`,
+  `sync-access` or `status` path ever reads it back. Omitting it therefore
+  costs nothing and avoids copying an *instance*-scoped superadmin password
+  into a second estate's repo, where whoever can decrypt it would own every
+  organization on the server. Pass `--record-admin-credentials` when the new
+  organization is another slice of the same estate and you want the
+  bootstrap/adopt file shape back.
+- **Re-running is safe, and deliberately so.** Infisical does not enforce
+  unique organization names, so a naive implementation would mint a twin on
+  every run. The organization is looked up by id, then slug, then name — the
+  same rule `adopt` uses to select one, shared code precisely so the find rule
+  cannot drift from the create rule — and the org admin file gates the command
+  exactly as it gates the other two: if its identity can log in, there is
+  nothing to do.
+
+The slug is derived from the name by the server, with a random suffix for
+uniqueness, and cannot be chosen (`xg-capital-strategies-6-ec-e`). Match on the
+name or the id.
 
 ### Group access
 
