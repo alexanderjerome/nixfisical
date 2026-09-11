@@ -100,7 +100,7 @@ second list to remember to update.
 #    identity, and record all of it in a SOPS-encrypted admin file.
 #    (Instance already initialised? Use `adopt` instead — see "Adopting an
 #    instance you did not bootstrap". `nixfisical status` will tell you which.)
-nix run github:alexanderjerome/nixfisical -- \
+nix run github:jeirslab/nixfisical -- \
   --url https://infisical.example.com \
   --admin-file nix/secrets/infisical-admin.yaml \
   bootstrap --organization "Example" --git-commit

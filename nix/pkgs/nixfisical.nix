@@ -64,7 +64,7 @@ python3Packages.buildPythonApplication rec {
 
   meta = with lib; {
     description = "Declarative bootstrap and secret reconciliation for a self-hosted Infisical instance";
-    homepage = "https://github.com/alexanderjerome/nixfisical";
+    homepage = "https://github.com/jeirslab/nixfisical";
     license = licenses.mit;
     mainProgram = "nixfisical";
     platforms = platforms.unix;
