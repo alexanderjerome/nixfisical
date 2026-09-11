@@ -164,10 +164,20 @@ buildNpmPackage {
   # `tsup` is configured with `skipNodeModulesBundle`, so `dist/` is not
   # self-contained: the runtime needs `node_modules` beside it. Prune to
   # production deps first -- the dev tree carries the whole toolchain.
+  #
+  # Deliberately WITHOUT `--legacy-peer-deps`, unlike the `npm ci` above.
+  # Prune recomputes which packages are reachable and deletes the rest, and
+  # under legacy resolution peer dependencies are not reachable from anything
+  # -- so it removed `express-session`, which nothing declares directly and
+  # `connect-redis` only asks for as a peer. `npm ci` had installed it (the
+  # lockfile carries it, `"peer": true`), the build succeeded, and the server
+  # then died on every start with ERR_MODULE_NOT_FOUND from inside
+  # connect-redis. The flag is needed for the install's range resolution; it
+  # is wrong for deciding what to keep.
   installPhase = ''
     runHook preInstall
 
-    npm prune --omit=dev --offline --no-audit --no-fund --legacy-peer-deps
+    npm prune --omit=dev --offline --no-audit --no-fund
 
     mkdir -p $out/lib/infisical
     cp -r dist node_modules package.json $out/lib/infisical/
@@ -240,13 +250,66 @@ buildNpmPackage {
   '';
 
   # `dist/main.mjs` boots the server, which wants a database. There is nothing
-  # to check here beyond the build having produced its entrypoints.
+  # to check here beyond the build having produced its entrypoints and a
+  # node_modules the runtime can actually resolve against.
   doCheck = false;
+
+  # stdenv only runs `postInstallCheck` from `installCheckPhase`, and skips
+  # that phase unless `doInstallCheck` is set. Without this the assertions
+  # below never execute -- they read as a safety net while checking nothing.
+  doInstallCheck = true;
 
   postInstallCheck = ''
     test -f $out/lib/infisical/dist/main.mjs
     test -f $out/lib/infisical/dist/db/knexfile.mjs
     test -f $out/lib/infisical/dist/db/auditlog-knexfile.mjs
+
+    # The prune above decides what to delete, and peer dependencies are the
+    # thing it gets wrong: nothing depends on them by name, so a wrong flag
+    # drops them and the build still succeeds. The cost lands at runtime, as
+    # ERR_MODULE_NOT_FOUND from inside whichever package asked for the peer.
+    # Assert every required (non-optional) peer of a retained package is still
+    # resolvable, so that mistake fails here instead of in a crashloop.
+    ${nodejs}/bin/node -e '
+      const fs = require("fs"), path = require("path");
+      const root = path.join(process.env.out, "lib/infisical/node_modules");
+      const missing = [];
+
+      // Presence walk rather than require.resolve: an ESM-only package with a
+      // restrictive "exports" map is unresolvable by path even when installed,
+      // which would report a missing dep that is right there.
+      const resolves = (from, dep) => {
+        for (let dir = from; dir.startsWith(root); dir = path.dirname(dir)) {
+          if (fs.existsSync(path.join(dir, "node_modules", dep))) return true;
+        }
+        return fs.existsSync(path.join(root, dep));
+      };
+
+      const scan = (dir) => {
+        for (const name of fs.readdirSync(dir)) {
+          if (name === ".bin") continue;
+          const p = path.join(dir, name);
+          if (name.startsWith("@")) { scan(p); continue; }
+          let pkg;
+          try { pkg = JSON.parse(fs.readFileSync(path.join(p, "package.json"))); }
+          catch (e) { continue; }
+          const meta = pkg.peerDependenciesMeta || {};
+          for (const dep of Object.keys(pkg.peerDependencies || {})) {
+            if (meta[dep] && meta[dep].optional) continue;
+            if (!resolves(p, dep)) missing.push(name + " needs " + dep);
+          }
+          const nested = path.join(p, "node_modules");
+          if (fs.existsSync(nested)) scan(nested);
+        }
+      };
+      scan(root);
+
+      if (missing.length) {
+        console.error("required peer dependencies missing from the pruned tree:");
+        for (const m of missing) console.error("  " + m);
+        process.exit(1);
+      }
+    '
   '';
 
   meta = with lib; {
