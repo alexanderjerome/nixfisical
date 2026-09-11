@@ -97,6 +97,103 @@
             esac
           '';
         };
+
+      # The same manifest, pushed:
+      #
+      #   packages.infisical-sync = nixfisical.mkSyncApp {
+      #     inherit pkgs;
+      #     nixosConfigurations = self.nixosConfigurations;
+      #     url = "https://infisical.example.org";
+      #   };
+      #
+      #   nix run .#infisical-sync -- --dry-run   # licence table, then what would change
+      #   nix run .#infisical-sync                # converge
+      #
+      # `sync`, then `sync-access`. The ordering is not stylistic: `sync-access`
+      # grants a group access to a project, so the project has to exist, and
+      # `sync` is what creates it -- run the other way round, a first
+      # convergence grants nothing and reports no error.
+      #
+      # Under `--dry-run` the full `license` table is printed in front of both.
+      # Only under `--dry-run`: it is twenty-five lines of reference material
+      # that does not change between runs, and `sync-access` prints the one line
+      # of it that does ("licence: none ...") on every run regardless. Putting
+      # it on the converge path would mean an operator reading past two screens
+      # of unchanged output to reach the two lines that say what happened, which
+      # is how output stops being read at all.
+      #
+      # Nothing is lost by leaving it off the converge path. It is a report, not
+      # a gate -- an unlicensed instance is the normal case and `sync` skips
+      # what the plan forbids on its own -- and it is not the early
+      # authentication check it looks like either, because `sync` logs in before
+      # it writes anything, so a missing age key or an expired sync identity
+      # fails there just as cleanly.
+      #
+      # THIS PRUNES. `sync` deletes secrets the manifest no longer declares, so
+      # deleting a `mkInfisical` annotation deletes the secret from Infisical on
+      # the next run. That is the declarative contract working, and it is still
+      # worth knowing before the first unattended run. `--dry-run` names every
+      # deletion.
+      #
+      # What it deliberately will not do is create a group. That needs
+      # `--create-missing-groups`, which writes to Infisical's Postgres behind
+      # the API, and a hammer that size should be swung by hand, once, not
+      # folded into the command an operator runs after every change.
+      #
+      # Runs on the operator's machine, not on the instance: the decryption is
+      # local and uses the operator's age key, which no host has.
+      mkSyncApp =
+        { pkgs
+        , nixosConfigurations
+        , url
+        , validate ? true
+        , adminFile ? "secrets/infisical-admin.yaml"
+          # Defaults to this flake's own build so a consumer needs neither the
+          # overlay nor a matching nixpkgs. Pass `pkgs.nixfisical` if you have it.
+        , nixfisical ? self.packages.${pkgs.stdenv.hostPlatform.system}.nixfisical
+        }:
+        let
+          manifestApp = self.mkManifestApp { inherit pkgs nixosConfigurations validate; };
+        in
+        pkgs.writeShellApplication {
+          name = "infisical-sync";
+          # coreutils for `mktemp`. writeShellApplication only prepends to the
+          # ambient PATH, so leaving it out works everywhere it is tried and
+          # depends on the caller's environment anyway.
+          runtimeInputs = [ manifestApp nixfisical pkgs.coreutils ];
+          text = ''
+            # --dry-run is the only flag, because it is the only one both
+            # subcommands accept. Anything else belongs on `nixfisical` itself,
+            # where the help text says which subcommand it applies to.
+            case "''${1-}" in
+              ""|--dry-run) ;;
+              *)
+                echo "usage: infisical-sync [--dry-run]" >&2
+                exit 1
+                ;;
+            esac
+
+            # A file rather than a pipe: both subcommands read the manifest, and
+            # `-` can only be consumed once.
+            manifest=$(mktemp)
+            trap 'rm -f "$manifest"' EXIT
+            infisical-manifest json > "$manifest"
+
+            if [ "''${1-}" = "--dry-run" ]; then
+              nixfisical --url ${pkgs.lib.escapeShellArg url} \
+                --admin-file ${pkgs.lib.escapeShellArg adminFile} license
+              echo ""
+            fi
+
+            nixfisical --url ${pkgs.lib.escapeShellArg url} \
+              --admin-file ${pkgs.lib.escapeShellArg adminFile} \
+              sync --manifest "$manifest" "$@"
+            echo ""
+            nixfisical --url ${pkgs.lib.escapeShellArg url} \
+              --admin-file ${pkgs.lib.escapeShellArg adminFile} \
+              sync-access --manifest "$manifest" "$@"
+          '';
+        };
     }
     // flake-utils.lib.eachDefaultSystem (system:
       let
@@ -149,6 +246,27 @@
 
         checks = {
           package = nixfisical;
+
+          # Build the sync app. There is nothing to assert about the result --
+          # the point is that `writeShellApplication` runs shellcheck and that
+          # the two helper functions resolve at all, neither of which happens
+          # anywhere else: `mkSyncApp` is a top-level function, so `nix flake
+          # check` never reaches it, and the first consumer to call it is the
+          # first thing to find out it does not evaluate.
+          #
+          # Which is how it went. Writing this cost one unbound variable
+          # (`mkManifestApp` where `self.mkManifestApp` was meant -- the
+          # function is an output attribute, not a `let` binding) and one
+          # `mktemp` resolved off the caller's PATH rather than the closure.
+          #
+          # An empty fleet on purpose. The manifest's *content* is checked
+          # above; this checks the script that carries it, and an empty one
+          # builds the same script.
+          sync-app = self.mkSyncApp {
+            inherit pkgs;
+            nixosConfigurations = { };
+            url = "https://infisical.invalid";
+          };
 
           # Evaluate the export module standalone and assert the manifest
           # walk produces what we expect: the name defaulting, the per-secret
