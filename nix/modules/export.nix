@@ -4,9 +4,35 @@
 # that targets the same option. So this re-declares `sops.secrets` with ONLY
 # a type contributing one new option. sops-nix's own declaration (its
 # defaults, descriptions, and the rest of its options) is untouched and still
-# wins; this adds a field and nothing else. sops-nix never reads `infisical`,
-# so the annotation is completely inert at deploy time — no activation
-# behaviour changes, no secret moves, nothing to roll back.
+# wins; this adds a field and nothing else.
+#
+# IT IS NOT FREE, and an earlier version of this comment said it was. sops-nix
+# builds its on-host manifest with
+#
+#   builtins.toJSON { secrets = builtins.attrValues cfg.secrets; ... }
+#
+# (modules/sops/manifest-for.nix) — the WHOLE submodule, fields it has never
+# heard of included. So `"infisical": null` lands in manifest.json for every
+# secret the moment this module is imported, which moves the manifest's store
+# path, which moves the host's toplevel. Importing this fleet-wide rebuilds
+# every host that uses sops, annotated or not; changing one annotation
+# afterwards rebuilds that host. Measured, not assumed: on a 17-host fleet the
+# import moved every toplevel except the three hosts with no sops secrets.
+#
+# What IS true: sops-nix never *reads* the field. `sops-install-secrets` is Go
+# and ignores unknown JSON keys, and its `-check-mode=sopsfile` validation
+# accepts the manifest, so the resulting activation is a no-op — same secrets,
+# same paths, same owners. The cost is a deploy, not a behaviour change.
+#
+# Two things to plan around:
+#
+#   * Import this in the same change as your first annotations, not ahead of
+#     them "to be safe". Importing alone buys a fleet-wide redeploy and
+#     nothing else.
+#   * The routing metadata (project, folder, environment, groups) ends up in a
+#     world-readable /nix/store path on each host. It names no values, and the
+#     encrypted SOPS file is already sitting next to it, but if a folder name
+#     is itself sensitive, that is where it leaks.
 #
 # A secret with no `infisical` (the default) is infra-only: it stays in SOPS,
 # reaches the host, and is never mirrored to Infisical. Exporting is opt-in

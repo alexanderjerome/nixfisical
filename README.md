@@ -46,6 +46,17 @@ A secret with no `infisical` block is infra-only: it stays in SOPS and never
 reaches Infisical. Exporting is opt-in per secret, because a fleet's SOPS file
 is full of things developers must not see.
 
+Importing `nixosModules.export` costs one deploy. sops-nix serialises the
+whole secret submodule into its on-host `manifest.json`, unknown fields and
+all, so `"infisical": null` appears against every secret as soon as the module
+is imported — which moves the manifest's store path and so every sops-using
+host's `toplevel`. The activation itself is a no-op (`sops-install-secrets`
+ignores the field and its `-check-mode=sopsfile` validation accepts it); it is
+a rebuild, not a behaviour change. Two practical consequences: import the
+module in the same change as your first annotations rather than ahead of them,
+and remember that `project` / `folder` / `groups` end up in a world-readable
+store path on each host — no values, but the folder names are visible.
+
 `nixfisical.lib.manifestOf` then walks every host and collects those
 annotations into one manifest — structure only, no values, nothing decrypted
 in the Nix store:
