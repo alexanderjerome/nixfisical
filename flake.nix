@@ -64,9 +64,12 @@
       #
       # The JSON is baked at eval time and contains no decrypted values —
       # only SOPS key paths and their routing.
-      mkManifestApp = { pkgs, nixosConfigurations, validate ? true }:
+      # `extraSecrets` is a list of `lib.mkExportOnly` results: secrets to
+      # export that no host declares. See the comment on `mkExportOnly` for
+      # when that is the honest thing to do rather than a shortcut.
+      mkManifestApp = { pkgs, nixosConfigurations, extraSecrets ? [ ], validate ? true }:
         let
-          raw = nixfisicalLib.manifestOf nixosConfigurations;
+          raw = nixfisicalLib.manifestFrom { inherit nixosConfigurations extraSecrets; };
           manifest = if validate then nixfisicalLib.assertManifest raw else raw;
           json = builtins.toJSON manifest;
         in
@@ -146,6 +149,10 @@
         { pkgs
         , nixosConfigurations
         , url
+          # Secrets to export that no host declares; see `lib.mkExportOnly`.
+          # They are pruned like any other entry: drop one here and the next
+          # sync deletes it from Infisical.
+        , extraSecrets ? [ ]
         , validate ? true
         , adminFile ? "secrets/infisical-admin.yaml"
           # The age identity to decrypt with, if SOPS_AGE_KEY_FILE is not
@@ -202,7 +209,9 @@
         , nixfisical ? self.packages.${pkgs.stdenv.hostPlatform.system}.nixfisical
         }:
         let
-          manifestApp = self.mkManifestApp { inherit pkgs nixosConfigurations validate; };
+          manifestApp = self.mkManifestApp {
+            inherit pkgs nixosConfigurations extraSecrets validate;
+          };
           inherit (pkgs) lib;
           # An operator entry -> the `EMAIL[:ROLE]` string the CLI parses.
           # Rejecting an attrset without `email` here rather than emitting
@@ -458,8 +467,58 @@
                 beta = mkHost "beta" shared;
               };
 
+              extraSecrets = [
+                # No host declares this one, and none should: a mailbox
+                # password is verified by the mail host as a hash and read in
+                # plaintext only by a person. It must still land with the same
+                # shape as every other entry, `hosts` empty.
+                (nixfisicalLib.mkExportOnly {
+                  sopsFile = "/fleet/secrets/mail-clients.yaml";
+                  sopsKey = "mail.engine_password";
+                  project = "platform";
+                  folder = "/mail";
+                })
+                # Redundant with alpha+beta's annotation: same file, same key,
+                # same destination. Must collapse into that one entry and leave
+                # its host provenance intact, not append a second entry racing
+                # it to the same coordinate.
+                (nixfisicalLib.mkExportOnly {
+                  sopsFile = "/fleet/secrets/api.yaml";
+                  sopsKey = "services/api/token";
+                  project = "apps";
+                  folder = "/api";
+                  groups = [ "developers" ];
+                })
+              ];
+
               manifest = nixfisicalLib.assertManifest
-                (nixfisicalLib.manifestOf configurations);
+                (nixfisicalLib.manifestFrom {
+                  nixosConfigurations = configurations;
+                  inherit extraSecrets;
+                });
+
+              # Two entries aimed at one Infisical coordinate from different
+              # files: nothing dedupes them, so `assertManifest` is the only
+              # thing standing between a typo and a secret that silently loses.
+              dupCaught = !(builtins.tryEval
+                (builtins.deepSeq
+                  (nixfisicalLib.assertManifest (nixfisicalLib.manifestFrom {
+                    extraSecrets = [
+                      (nixfisicalLib.mkExportOnly {
+                        sopsFile = "/fleet/secrets/a.yaml";
+                        sopsKey = "pw";
+                        project = "platform";
+                        name = "PW";
+                      })
+                      (nixfisicalLib.mkExportOnly {
+                        sopsFile = "/fleet/secrets/b.yaml";
+                        sopsKey = "other";
+                        project = "platform";
+                        name = "PW";
+                      })
+                    ];
+                  }))
+                  true)).success;
 
               actual = builtins.toJSON manifest;
 
@@ -506,16 +565,30 @@
                   sopsFile = "/fleet/secrets/infra-db.yaml";
                   sopsKey = "mealie";
                 }
+                {
+                  environment = "prod";
+                  folder = "/mail";
+                  groups = [ ];
+                  hosts = [ ];
+                  name = "mail.engine_password";
+                  project = "platform";
+                  sopsFile = "/fleet/secrets/mail-clients.yaml";
+                  sopsKey = "mail.engine_password";
+                }
               ];
             in
-            if actual == expected
-            then "echo ok > $out"
-            else
+            if actual != expected then
               throw ''
                 nixfisical manifest check failed.
                   expected: ${expected}
                   actual:   ${actual}
               ''
+            else if !dupCaught then
+              throw ''
+                nixfisical manifest check failed: assertManifest accepted two
+                entries declared into the same Infisical destination.
+              ''
+            else "echo ok > $out"
           );
         };
 

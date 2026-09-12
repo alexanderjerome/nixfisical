@@ -91,6 +91,44 @@ Because the declaration lives next to the secret, rotation is automatic. Change
 the value in SOPS, redeploy, run the sync — Infisical follows. There is no
 second list to remember to update.
 
+### Secrets no host holds
+
+Riding on `sops.secrets` means the exported set is exactly the set some machine
+consumes, which is the right default. It breaks down for a credential whose
+only consumer is a person or an agent's client — a mailbox password the mail
+host verifies as a `$6$` hash and must never hold in plaintext, an API token
+you hand out but never deploy. Declaring one on a host to make the export work
+puts a lie in the fleet's manifest, and sops-nix would then materialise the
+credential on a machine with no use for it.
+
+Name those directly instead, and pass them as `extraSecrets`:
+
+```nix
+packages.infisical-manifest = nixfisical.mkManifestApp {
+  inherit pkgs;
+  nixosConfigurations = self.nixosConfigurations;
+  extraSecrets = [
+    (nixfisical.lib.mkExportOnly {
+      sopsFile = ./secrets/mail-clients.yaml;
+      sopsKey  = "mail.engine_password";
+      project  = "platform";
+      folder   = "/mail";
+      name     = "ENGINE_MAILBOX_PASSWORD";
+    })
+  ];
+};
+```
+
+The result is an ordinary manifest entry with `"hosts": []`, validated, deduped
+and **pruned** like any other: delete the `mkExportOnly` call and the next sync
+deletes the secret from Infisical. The SOPS file still has to be decryptable by
+whoever runs the sync — an entry says where a secret goes, never who may read
+it. `mkSyncApp` takes the same argument.
+
+Use it for secrets no host can honestly declare, not as a shortcut around
+annotating one that can: an export-only entry has no `restartUnits`, no
+rotation path through a deploy, and nothing tying it to the thing that uses it.
+
 ## Quick start
 
 ```sh
@@ -123,7 +161,9 @@ updated, and **deleted**. Run it first.
 | Output | What it is |
 | --- | --- |
 | `lib.mkInfisical` | Annotate a `sops.secrets` entry for export. |
+| `lib.mkExportOnly` | Export a secret no host declares. |
 | `lib.manifestOf` | `nixosConfigurations` → manifest list. |
+| `lib.manifestFrom` | `{ nixosConfigurations, extraSecrets }` → manifest list. |
 | `lib.assertManifest` | Fail evaluation on a malformed manifest. |
 | `mkManifestApp` | Wrap a manifest as a `nix run .#infisical-manifest` app. |
 | `nixosModules.export` | Adds `sops.secrets.<key>.infisical`. |

@@ -7,6 +7,12 @@
 #   manifestOf    walks a fleet's `nixosConfigurations` and collects every
 #                 such annotation into a flat, deduped manifest.
 #
+# plus an escape hatch for secrets no host declares:
+#
+#   mkExportOnly  names a (sopsFile, sopsKey) directly, with no host behind it.
+#   manifestFrom  the general form of manifestOf — hosts and export-only
+#                 entries merged into one manifest.
+#
 # The manifest is STRUCTURE ONLY — it names SOPS keys, never values. Nothing
 # decrypted ever enters the Nix store. The `nixfisical sync` CLI takes this
 # manifest plus your age key and does the decryption at run time, on the
@@ -35,14 +41,68 @@ rec {
       inherit project folder environment name groups;
     };
 
+  # Export a secret that NO host declares.
+  #
+  # `mkInfisical` rides on a `sops.secrets` entry, which means the exported set
+  # is exactly the set some machine consumes. That is the right default and
+  # should stay the common case. It breaks down for a credential whose only
+  # consumer is a person or an agent's client: mailbox passwords that the mail
+  # host verifies as hashes and must never hold in plaintext, an API token
+  # handed out but never deployed. Declaring those on a host to make the export
+  # work is a lie in the fleet's own manifest, and sops-nix would then
+  # materialise the credential on a machine with no use for it.
+  #
+  # So name the file and key directly:
+  #
+  #   nixfisical.lib.mkExportOnly {
+  #     sopsFile = ./secrets/mail-clients.yaml;
+  #     sopsKey  = "mail.engine_password";
+  #     project  = "platform";
+  #     folder   = "/mail";
+  #   }
+  #
+  # The result is an ordinary manifest entry with `hosts = [ ]`. It is
+  # validated, deduped and PRUNED exactly like a host-derived one: drop the
+  # declaration and the next sync deletes the secret from Infisical. The
+  # sopsFile must still be decryptable by whoever runs the sync — the entry
+  # asserts nothing about who can read it, only where it goes.
+  mkExportOnly =
+    { sopsFile
+    , sopsKey
+    , project
+    , folder ? "/"
+    , environment ? "prod"
+    , name ? null
+    , groups ? [ ]
+    }: {
+      inherit sopsKey project folder environment groups;
+      sopsFile = toString sopsFile;
+      host = null;
+      name = if name != null then name else lib.last (lib.splitString "/" sopsKey);
+    };
+
   # nixosConfigurations -> [ manifestEntry ]
+  #
+  # The host-only form, kept as the public entry point it has always been.
+  manifestOf = nixosConfigurations: manifestFrom { inherit nixosConfigurations; };
+
+  # { nixosConfigurations, extraSecrets } -> [ manifestEntry ]
   #
   # An entry carries its OWN `sopsFile`. sops-nix already tracks this per
   # secret (`sops.secrets.<k>.sopsFile`, defaulting to `sops.defaultSopsFile`),
   # so a fleet whose secrets are split across several encrypted files exports
   # correctly without the sync tool having to guess. Emitting it here is what
   # lets the CLI stay file-agnostic.
-  manifestOf = nixosConfigurations:
+  #
+  # `extraSecrets` is a list of `mkExportOnly` results. They join the same
+  # pipeline as host-derived entries rather than being appended afterwards, so
+  # the dedupe below sees both: an export-only entry naming a (sopsFile,
+  # sopsKey) some host also exports collapses into that host's entry instead of
+  # becoming a second entry racing it to the same destination.
+  manifestFrom =
+    { nixosConfigurations ? { }
+    , extraSecrets ? [ ]
+    }:
     let
       perHost = lib.mapAttrsToList
         (host: node:
@@ -75,7 +135,10 @@ rec {
             (node.config.sops.secrets or { }))
         nixosConfigurations;
 
-      flat = lib.filter (x: x != null) (lib.flatten perHost);
+      # Host-derived first, so that on a (sopsFile, sopsKey) collision the fold
+      # below keeps the host's destination and the export-only entry only
+      # contributes its (empty) host list.
+      flat = lib.filter (x: x != null) (lib.flatten perHost) ++ extraSecrets;
 
       # Dedupe on (sopsFile, sopsKey), not sopsKey alone: the same key path can
       # legitimately exist in two different encrypted files (e.g. a per-network
@@ -83,17 +146,22 @@ rec {
       # that share an entry are unioned into `hosts`.
       identity = e: "${toString e.sopsFile}#${e.sopsKey}";
 
+      # `host = null` (an export-only entry) contributes nothing to `hosts`,
+      # leaving it empty. That empty list is the manifest's record that the
+      # secret is exported on nobody's behalf — the CLI treats `hosts` as
+      # provenance, never as a target.
       byKey = lib.foldl'
         (acc: e:
           let
             k = identity e;
             prev = acc.${k} or null;
+            hosts = lib.optional (e.host != null) e.host;
           in
           acc // {
             ${k} =
               if prev == null
-              then (removeAttrs e [ "host" ]) // { hosts = [ e.host ]; }
-              else prev // { hosts = lib.unique (prev.hosts ++ [ e.host ]); };
+              then (removeAttrs e [ "host" ]) // { inherit hosts; }
+              else prev // { hosts = lib.unique (prev.hosts ++ hosts); };
           })
         { }
         flat;
@@ -117,6 +185,22 @@ rec {
       # the CLI as a lookup that cannot be phrased, let alone explained.
       emptyKey = lib.filter (e: e.sopsKey == "") manifest;
 
+      # Two entries writing the same Infisical coordinate: one wins, and which
+      # one depends on manifest ordering. `nixfisical validate` catches this
+      # too, but only once the manifest has been rendered and handed to the
+      # CLI. It is worth catching a step earlier now that `mkExportOnly` lets a
+      # `name` be typed by hand rather than derived from a key some host
+      # already declares -- a typo there aims two secrets at one destination.
+      coordinate = e: "${e.project}/${e.environment}${e.folder}:${e.name}";
+      dupDest =
+        let
+          counts = lib.foldl'
+            (acc: e: acc // { ${coordinate e} = (acc.${coordinate e} or 0) + 1; })
+            { }
+            manifest;
+        in
+        lib.filter (e: counts.${coordinate e} > 1) manifest;
+
       err = msg: entries:
         lib.optional (entries != [ ])
           "${msg}: ${lib.concatMapStringsSep ", " (e: e.sopsKey) entries}";
@@ -131,7 +215,8 @@ rec {
         (err "secrets with no sopsFile (set sops.defaultSopsFile or a per-secret sopsFile)" missingFile)
         ++ (err "environment slugs must match [a-z0-9-]+" badEnv)
         ++ (err "folder paths must be absolute (start with /)" badFolder)
-        ++ (errBy "whole-file secrets (key = \"\") cannot be exported; name a key" emptyKey);
+        ++ (errBy "whole-file secrets (key = \"\") cannot be exported; name a key" emptyKey)
+        ++ (errBy "two secrets declared into the same Infisical destination" dupDest);
     in
     if problems == [ ]
     then manifest
