@@ -20,6 +20,7 @@ from nixfisical.access import (
     BUILTIN_PROJECT_ROLES,
     DEFAULT_OPERATOR_ROLE,
     AccessError,
+    manifest_projects,
     parse_operators,
     sync_access,
 )
@@ -180,3 +181,101 @@ def test_built_in_operator_roles_pass_the_gate() -> None:
         details = " ".join(action.detail for action in summary.actions)
         assert "could not list projects" in details
         assert role not in details
+
+
+# -- the operator pass must not be driven by `groups` -----------------------
+#
+# This is the silent failure the module header describes, reached by the route
+# nobody checks. The operator pass used to iterate the grant map, which is keyed
+# only by projects that name a group. A project shared with no group therefore
+# got no operator -- and since `sync` creates projects as a machine identity,
+# "no operator" means visible to no human at all. It exits 0, the secrets are
+# correct, and the project simply is not there when you log in.
+#
+# It is the *administrator-only* project that hits this, so the bug removed
+# visibility from exactly the secrets chosen to be most closely held.
+
+
+class FakeClient:
+    """Enough of the client for the grant and operator passes to run."""
+
+    def __init__(self, projects: dict[str, str]) -> None:
+        self._projects = projects
+        self.added_users: list[tuple[str, str, str]] = []
+
+    def list_projects(self, organization_id: str) -> dict[str, str]:
+        return dict(self._projects)
+
+    def list_organization_groups(self) -> dict[str, str]:
+        return {"developers": "group-id"}
+
+    def list_project_groups(self, project_id: str) -> dict[str, str]:
+        return {}
+
+    def list_project_users(self, project_id: str) -> dict[str, str]:
+        return {}
+
+    def add_group_to_project(self, *, project_id: str, group_id: str, role: str) -> None:
+        return None
+
+    def add_user_to_project(self, *, project_id: str, email: str, role: str) -> None:
+        self.added_users.append((project_id, email, role))
+
+
+def test_a_project_with_no_groups_still_gets_its_operator() -> None:
+    client = FakeClient({"shared": "id-shared", "private": "id-private"})
+    summary = sync_access(
+        client,
+        [
+            {"project": "shared", "groups": ["developers"]},
+            {"project": "private"},  # no `groups` -- administrator only
+        ],
+        organization_id="org-id",
+        operators=["admin@example.org:admin"],
+    )
+    assert summary.ok
+    assert ("id-private", "admin@example.org", "admin") in client.added_users
+    assert ("id-shared", "admin@example.org", "admin") in client.added_users
+
+
+def test_a_manifest_with_no_groups_at_all_still_grants_operators() -> None:
+    # The other half of the same bug: `sync_access` returned early when the
+    # grant map was empty, so an estate that never uses groups -- which is
+    # every unlicensed instance, since group creation is plan-gated -- got no
+    # operator memberships from any project.
+    client = FakeClient({"private": "id-private"})
+    summary = sync_access(
+        client,
+        [{"project": "private"}],
+        organization_id="org-id",
+        operators=["admin@example.org:admin"],
+    )
+    assert summary.ok
+    assert client.added_users == [("id-private", "admin@example.org", "admin")]
+
+
+def test_manifest_projects_is_wider_than_the_grant_map() -> None:
+    entries = [
+        {"project": "shared", "groups": ["developers"]},
+        {"project": "private"},
+        {"project": "private", "groups": []},
+        {"groups": ["developers"]},  # no project: not a target
+    ]
+    assert manifest_projects(entries) == {"shared", "private"}
+
+
+def test_an_operator_is_not_invented_for_a_project_sync_never_created() -> None:
+    # Failing loudly matters here: the fix widened the set of projects this
+    # pass walks, so a project the manifest names but `sync` has not created
+    # reaches it for the first time. Silently skipping would reintroduce the
+    # same "looks fine, is not there" outcome one level up.
+    client = FakeClient({})
+    summary = sync_access(
+        client,
+        [{"project": "private"}],
+        organization_id="org-id",
+        operators=["admin@example.org:admin"],
+    )
+    assert not summary.ok
+    assert client.added_users == []
+    assert any("run 'nixfisical sync' first" in a.detail for a in summary.actions)
