@@ -762,6 +762,9 @@ def sync_command(
         ("DRY RUN " if dry_run else "") + summary.headline(),
         fg="yellow" if dry_run else ("green" if summary.ok else "red"),
     )
+    legend = summary.legend()
+    if legend:
+        click.secho(legend, fg="yellow")
     if not summary.ok:
         sys.exit(EXIT_RUNTIME)
 

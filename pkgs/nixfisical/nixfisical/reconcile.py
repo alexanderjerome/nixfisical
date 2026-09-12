@@ -68,6 +68,20 @@ class ReconcileSummary:
     errors: list[str] = field(default_factory=list)
     actions: list[Action] = field(default_factory=list)
 
+    # Writes a dry run would attempt but cannot classify as create-vs-no-op.
+    #
+    # A dry run lists projects and it lists live secrets for the prune pass, so
+    # `projects_created` and `secrets_pruned` are exact. It does NOT list
+    # environments, folders, or secret values -- ensure/upsert are idempotent
+    # server-side and the run is cheaper for not asking. The cost of not asking
+    # is that "would create 5 folders" and "5 folders already match" are
+    # indistinguishable from here, so these count *planned writes* and the
+    # headline marks them `~` rather than folding them into the `+` counters and
+    # claiming a precision this run does not have.
+    environments_planned: int = 0
+    folders_planned: int = 0
+    secrets_planned: int = 0
+
     def record(self, kind: str, target: str, result: str, detail: str = "") -> None:
         self.actions.append(Action(kind=kind, target=target, result=result, detail=detail))
 
@@ -80,13 +94,34 @@ class ReconcileSummary:
         return not self.errors
 
     def headline(self) -> str:
-        verb = "would apply" if self.dry_run else "applied"
+        if self.dry_run:
+            # `+` where the run knows, `~` where it would write without knowing
+            # whether the write changes anything. Reporting the `~` figures as
+            # `+0` -- which is what this did until the counters below existed --
+            # renders a plan of nine writes as "nothing to do", and the headline
+            # is the line an operator actually reads.
+            return (
+                f"would apply: projects +{self.projects_created}, "
+                f"environments ~{self.environments_planned}, "
+                f"folders ~{self.folders_planned}, "
+                f"secrets ~{self.secrets_planned}, "
+                f"pruned -{self.secrets_pruned}, errors {len(self.errors)}"
+            )
         return (
-            f"{verb}: projects +{self.projects_created}, "
+            f"applied: projects +{self.projects_created}, "
             f"environments +{self.environments_created}, "
             f"folders +{self.folders_created}, "
             f"secrets +{self.secrets_created}/~{self.secrets_updated}, "
             f"pruned -{self.secrets_pruned}, errors {len(self.errors)}"
+        )
+
+    def legend(self) -> str:
+        """One line explaining the dry-run headline's `~`. Empty when applied."""
+        if not self.dry_run:
+            return ""
+        return (
+            "  ~ = would be written; a dry run does not list environments, "
+            "folders or secret values, so it cannot say which already match."
         )
 
 
@@ -196,9 +231,10 @@ def reconcile(
                 "project does not exist yet",
             )
             if dry_run:
-                summary.environments_created += 1
+                summary.environments_planned += 1
             continue
         if dry_run:
+            summary.environments_planned += 1
             summary.record("environment", target, "would-ensure")
             continue
         try:
@@ -240,9 +276,10 @@ def reconcile(
                 "project does not exist yet",
             )
             if dry_run:
-                summary.folders_created += 1
+                summary.folders_planned += 1
             continue
         if dry_run:
+            summary.folders_planned += 1
             summary.record("folder", target, "would-ensure")
             continue
         try:
@@ -280,7 +317,7 @@ def reconcile(
                 "project does not exist yet",
             )
             if dry_run:
-                summary.secrets_created += 1
+                summary.secrets_planned += 1
             continue
 
         if dry_run:
@@ -293,6 +330,7 @@ def reconcile(
             except SopsError as exc:
                 summary.fail("secret", target, str(exc))
                 continue
+            summary.secrets_planned += 1
             summary.record("secret", target, "would-upsert", f"from {sops_file}")
             continue
 
