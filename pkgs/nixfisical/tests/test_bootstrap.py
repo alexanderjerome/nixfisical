@@ -8,12 +8,18 @@ quietly lands in the wrong estate's repo, or a find rule that quietly stops
 agreeing with the create rule and mints a duplicate organization on every run.
 """
 
+import pytest
+import yaml
+
 from nixfisical.bootstrap import (
     AdminCredentials,
     build_admin_document,
     describe_organizations,
+    has_admin_block,
     match_organization,
+    read_admin_email,
 )
+from nixfisical.sops import SopsError
 
 ORG = {"id": "org-id", "name": "XG Capital Strategies", "slug": "xg-6ece"}
 OTHER = {"id": "other-id", "name": "jeirslab", "slug": "jeirslab-07xg"}
@@ -60,6 +66,64 @@ def test_recording_credentials_restores_the_bootstrap_shape() -> None:
     )
     assert set(document) == {"admin", "organization", "sync_identity"}
     assert document["admin"] == {"email": "a@b.c", "password": "pw", "user_id": "u1"}
+
+
+# -- reading back the block that is not there ------------------------------
+#
+# The pair above establishes that a per-org file has no admin block. This is
+# the other end of that: `sync-access` defaults its --operator to that block's
+# email, so the first consumer to sync from a per-org file meets the absence.
+# Left to sops it reports as "error truncating tree: component ['admin'] not
+# found", which reads like a corrupt file and describes a correct one. Assert
+# the diagnosis, not just the raising -- the message IS the fix here.
+
+
+def test_reading_the_admin_email_off_a_per_org_file_says_why(tmp_path) -> None:
+    admin_file = tmp_path / "infisical-admin.yaml"
+    admin_file.write_text(
+        yaml.safe_dump(
+            {
+                **build_admin_document(
+                    credentials=None,
+                    user_id="u1",
+                    organization=ORG,
+                    identity_id="i1",
+                    client_id="c1",
+                    client_secret="s1",
+                ),
+                "sops": {"version": "3.13.3"},
+            }
+        )
+    )
+
+    assert has_admin_block(admin_file) is False
+
+    with pytest.raises(SopsError) as caught:
+        read_admin_email(admin_file)
+    assert "per-organization" in str(caught.value)
+
+
+def test_an_instance_file_still_reads_as_one(tmp_path) -> None:
+    """The shape check must not reject the file it was written to allow."""
+    admin_file = tmp_path / "infisical-admin.yaml"
+    admin_file.write_text(
+        yaml.safe_dump(
+            {
+                **build_admin_document(
+                    credentials=AdminCredentials(
+                        email="a@b.c", password="pw", generated=True
+                    ),
+                    user_id="u1",
+                    organization=ORG,
+                    identity_id="i1",
+                    client_id="c1",
+                    client_secret="s1",
+                ),
+                "sops": {"version": "3.13.3"},
+            }
+        )
+    )
+    assert has_admin_block(admin_file) is True
 
 
 # -- the find-or-create rule -----------------------------------------------

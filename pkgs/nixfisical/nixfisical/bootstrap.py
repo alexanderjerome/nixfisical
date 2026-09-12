@@ -78,7 +78,13 @@ from typing import Any
 import yaml
 
 from nixfisical.api import InfisicalClient, InfisicalError, UniversalAuthCredentials
-from nixfisical.sops import SopsError, encrypt_in_place, extract, sops_key_expr
+from nixfisical.sops import (
+    SopsError,
+    encrypt_in_place,
+    extract,
+    sops_key_expr,
+    top_level_keys,
+)
 
 __all__ = [
     "BootstrapError",
@@ -185,6 +191,21 @@ def read_organization_id(admin_file: Path) -> str:
     return extract(admin_file, sops_key_expr(_KEY_ORG_ID))
 
 
+def has_admin_block(admin_file: Path) -> bool:
+    """Whether ``admin_file`` carries an ``admin`` block at all.
+
+    This is the difference between the two shapes of admin file. ``bootstrap``
+    and ``adopt`` write an INSTANCE file, which has one; ``add-org`` writes a
+    PER-ORG file, which deliberately does not, because the superadmin password
+    is scoped to the whole server and copying it into another estate's repo
+    would hand that estate every other organization on the instance.
+
+    Cheap and safe: sops encrypts values, not key names, so this reads the
+    document's shape off the ciphertext without decrypting anything.
+    """
+    return "admin" in top_level_keys(admin_file)
+
+
 def read_admin_email(admin_file: Path) -> str:
     """Extract just the superadmin's email address.
 
@@ -192,7 +213,18 @@ def read_admin_email(admin_file: Path) -> str:
     needs to know *who* the operator is so it can put them on the projects it
     manages, and has no business decrypting their password to find out. An
     email is not a credential.
+
+    Raises :class:`SopsError` naming the per-org case when there is no ``admin``
+    block. Left to sops, the same situation reports as "error truncating tree:
+    component ['admin'] not found", which reads like a corrupt file and is in
+    fact a correctly-formed one being asked the wrong question.
     """
+    if not has_admin_block(admin_file):
+        raise SopsError(
+            f"{admin_file} has no 'admin' block: it is a per-organization admin "
+            "file, which records the org and its sync identity but not the "
+            "instance superadmin"
+        )
     return extract(admin_file, sops_key_expr(_KEY_ADMIN_EMAIL))
 
 

@@ -160,12 +160,30 @@
           # and means neither. A flake app is run from outside any dev shell by
           # definition, so it is the likeliest place to meet that.
         , ageKeyFile ? null
+          # The human `sync-access` puts on every project it manages, as an
+          # email. Null means "read it from the admin file", which works for an
+          # INSTANCE admin file and cannot work for a PER-ORG one: `add-org`
+          # deliberately omits the admin block, so there is no email in there to
+          # read. A consumer syncing into its own organization on a shared
+          # instance is exactly that case and must set this.
+          #
+          # Set it to `false` to pass --no-operator instead, accepting projects
+          # whose only member is the sync machine identity -- which is to say,
+          # projects no human can see. That is a real choice for an unattended
+          # estate and a bad surprise anywhere else.
+        , operator ? null
           # Defaults to this flake's own build so a consumer needs neither the
           # overlay nor a matching nixpkgs. Pass `pkgs.nixfisical` if you have it.
         , nixfisical ? self.packages.${pkgs.stdenv.hostPlatform.system}.nixfisical
         }:
         let
           manifestApp = self.mkManifestApp { inherit pkgs nixosConfigurations validate; };
+          # Only `sync-access` takes these; `sync` would reject them, which is
+          # why they are baked in here rather than left to the caller's "$@".
+          accessArgs =
+            if operator == null then ""
+            else if operator == false then " --no-operator"
+            else " --operator ${pkgs.lib.escapeShellArg operator}";
         in
         pkgs.writeShellApplication {
           name = "infisical-sync";
@@ -219,7 +237,7 @@
             echo ""
             nixfisical --url ${pkgs.lib.escapeShellArg url} \
               --admin-file ${pkgs.lib.escapeShellArg adminFile} \
-              sync-access --manifest "$manifest" "$@"
+              sync-access --manifest "$manifest"${accessArgs} "$@"
           '';
         };
     }

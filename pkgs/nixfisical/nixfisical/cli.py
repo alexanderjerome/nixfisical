@@ -958,7 +958,13 @@ def sync_access_command(
                 try:
                     chosen_operators = (read_admin_email(admin_file),)
                 except SopsError as exc:
-                    _fail(f"could not read the admin email from {admin_file}: {exc}")
+                    _fail(
+                        f"could not read the admin email from {admin_file}: {exc}\n"
+                        "  pass --operator <email> to name the human this sync "
+                        "should put on its projects,\n"
+                        "  or --no-operator to accept projects whose only member "
+                        "is the sync machine identity"
+                    )
                     return
 
         summary = run_sync_access(

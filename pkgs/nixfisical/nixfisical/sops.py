@@ -59,6 +59,7 @@ __all__ = [
     "extract",
     "read_key",
     "sops_key_expr",
+    "top_level_keys",
     "clear_cache",
     # write side
     "has_key",
@@ -154,6 +155,33 @@ def extract(file: Path, key_path: str) -> str:
     if not value:
         raise SopsError(f"sops returned an empty value for {key_path} in {file}")
     return value
+
+
+def top_level_keys(file: Path) -> set[str]:
+    """Return ``file``'s top-level key names without decrypting anything.
+
+    sops encrypts values, not key names, so the shape of a document is readable
+    from the ciphertext. That is the whole point of this function: it lets a
+    caller ask "does this admin file have an ``admin`` block?" -- the difference
+    between an instance admin file and a per-org one -- without unwrapping a
+    key, prompting for a touch, or holding a superadmin password in memory to
+    answer a question about structure.
+
+    ``sops`` itself is excluded; it is metadata, not content.
+    """
+    file = Path(file)
+    if not file.is_file():
+        raise SopsError(f"sops file does not exist: {file}")
+
+    try:
+        document = yaml.safe_load(file.read_text())
+    except yaml.YAMLError as exc:
+        raise SopsError(f"{file} is not parseable as YAML: {exc}") from exc
+
+    if not isinstance(document, dict):
+        raise SopsError(f"{file} is not a YAML mapping")
+
+    return {str(key) for key in document if key != "sops"}
 
 
 def _cache_key(file: Path) -> str:
