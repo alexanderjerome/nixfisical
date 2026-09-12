@@ -1,9 +1,17 @@
 """Reconcile *who can see* the secrets that ``sync`` writes.
 
-``sync`` converges secret values. It says nothing about access: a project the
-manifest created is visible to the org's admins and to nobody else, which is
-the safe default and also not the point. The manifest's ``groups`` field says
-which groups should be able to read a secret, and this module makes that true.
+``sync`` converges secret values. It says nothing about access. The manifest's
+``groups`` field says which groups should be able to read a secret, and this
+module makes that true.
+
+A correction worth stating plainly, because this module was written on the
+opposite assumption: a project created by ``sync`` is visible to **nobody**,
+including the organization's own admins. Project membership in Infisical is
+per-project and explicit, and ``sync`` authenticates as a machine identity, so
+the identity becomes the project's admin and no human is a member at all. The
+observable symptom is an operator logging into a freshly synced instance,
+seeing an empty project list, and concluding the sync never ran. That is what
+the ``operators`` pass below exists to prevent; it is not a convenience.
 
 Access is modelled at the project level, not the secret level, and that is a
 deliberate narrowing of what the manifest can express. Infisical's access
@@ -20,6 +28,13 @@ separate command:
 1. **Adding an existing group to a project** is a supported, documented API
    call and is not gated by the license. This is the common case and it runs by
    default.
+1b. **Adding a human operator to a project** is likewise ungated, and is the
+   same call the UI's "Add member" button makes. Groups are how *consumers* get
+   access; this is how the person running the tool keeps being able to see what
+   it did. The two are separate because a group grant does not imply
+   membership: an operator can be in ``developers``, ``developers`` can hold
+   the project, and the operator still not appear in the project's member list.
+
 2. **Creating the group itself** is gated: ``getDefaultOnPremFeatures()`` in
    upstream sets ``groups: false``, and ``createGroup`` refuses with "Failed to
    create group due to plan restriction" on any self-hosted instance without an
@@ -57,6 +72,7 @@ __all__ = [
     "Database",
     "DEFAULT_PROJECT_ROLE",
     "DEFAULT_ORG_ROLE",
+    "DEFAULT_OPERATOR_ROLE",
     "SCHEMA_VERIFIED_AGAINST",
     "group_targets",
     "slugify",
@@ -77,6 +93,13 @@ BUILTIN_PROJECT_ROLES = frozenset({"admin", "member", "viewer", "no-access"})
 # role that lets someone belong to the org at all; project access is granted
 # separately and explicitly below.
 DEFAULT_ORG_ROLE = "member"
+
+# Role given to an operator on a project this tool manages. `admin` and not
+# `viewer`, unlike a group grant: the operator is the person who has to fix
+# this instance when it breaks, and read-only access to a project they cannot
+# administer is the wrong tool for that. It is also not an escalation -- they
+# hold the superadmin credential that created the project in the first place.
+DEFAULT_OPERATOR_ROLE = "admin"
 
 # The upstream release whose schema the SQL below was read off. Recorded in the
 # preflight failure message because the failure mode this guards against is a
@@ -122,6 +145,7 @@ class AccessSummary:
     dry_run: bool = False
     groups_created: int = 0
     grants_created: int = 0
+    memberships_created: int = 0
     errors: list[str] = field(default_factory=list)
     actions: list[Action] = field(default_factory=list)
 
@@ -152,6 +176,7 @@ class AccessSummary:
         line = (
             f"{verb}: groups +{self.groups_created}, "
             f"project grants +{self.grants_created}, "
+            f"operator memberships +{self.memberships_created}, "
             f"errors {len(self.errors)}"
         )
         if self.skipped:
@@ -441,11 +466,19 @@ def sync_access(
     organization_id: str,
     project_role: str = DEFAULT_PROJECT_ROLE,
     org_role: str = DEFAULT_ORG_ROLE,
+    operators: Iterable[str] = (),
+    operator_role: str = DEFAULT_OPERATOR_ROLE,
     database: Database | None = None,
     plan: Plan | None = None,
     dry_run: bool = False,
 ) -> AccessSummary:
     """Grant every manifest group access to every project it appears in.
+
+    ``operators`` are email addresses of humans who should hold direct
+    membership on every project the manifest touches -- normally just the admin
+    from the admin file. Without this they hold nothing: see the module
+    docstring on why an org admin cannot see a synced project. Passing an empty
+    iterable skips the pass entirely and restores the previous behaviour.
 
     ``database`` is the opt-in escape hatch: when it is None, a group the
     manifest names but the instance does not have is recorded as an error
@@ -634,5 +667,44 @@ def sync_access(
                 continue
             summary.grants_created += 1
             summary.record("grant", target, "created", f"role {project_role}")
+
+    # -- 3. operator memberships -------------------------------------------
+    # Runs over the same projects as the grant pass, so an operator ends up on
+    # exactly the projects the manifest describes and no others. Failures here
+    # are recorded and do not abort: a missing membership makes the instance
+    # hard to inspect, which is bad, but it does not make the secrets wrong.
+    wanted_operators = sorted({e.strip().lower() for e in operators if e and e.strip()})
+    for project_name in sorted(targets) if wanted_operators else ():
+        project_id = project_ids.get(project_name)
+        if project_id is None:
+            # The grant pass already reported this project as missing.
+            continue
+
+        try:
+            members = client.list_project_users(project_id)
+        except InfisicalError as exc:
+            summary.fail(
+                "membership", project_name, f"could not list project users: {exc}"
+            )
+            continue
+
+        for email in wanted_operators:
+            target = f"{project_name}:{email}"
+            if email in members:
+                summary.record("membership", target, "exists", f"role {members[email]}")
+                continue
+            if dry_run:
+                summary.memberships_created += 1
+                summary.record("membership", target, "would-create", f"role {operator_role}")
+                continue
+            try:
+                client.add_user_to_project(
+                    project_id=project_id, email=email, role=operator_role
+                )
+            except InfisicalError as exc:
+                summary.fail("membership", target, str(exc))
+                continue
+            summary.memberships_created += 1
+            summary.record("membership", target, "created", f"role {operator_role}")
 
     return summary

@@ -61,6 +61,7 @@ import click
 
 from nixfisical import __version__
 from nixfisical.access import (
+    DEFAULT_OPERATOR_ROLE,
     DEFAULT_ORG_ROLE,
     DEFAULT_PROJECT_ROLE,
     SCHEMA_VERIFIED_AGAINST,
@@ -77,6 +78,7 @@ from nixfisical.bootstrap import (
     add_org as run_add_org,
     adopt as run_adopt,
     bootstrap as run_bootstrap,
+    read_admin_email,
     read_organization_id,
     read_sync_credentials,
     split_file_key,
@@ -798,6 +800,28 @@ def sync_command(
     "--create-missing-groups.",
 )
 @click.option(
+    "--operator",
+    "operators",
+    multiple=True,
+    metavar="EMAIL",
+    help="Human who should hold direct membership on every managed project. "
+    "Repeatable. Defaults to the admin recorded in the admin file, because a "
+    "project created by the sync identity is visible to no human otherwise.",
+)
+@click.option(
+    "--operator-role",
+    default=DEFAULT_OPERATOR_ROLE,
+    show_default=True,
+    help="Project role given to each --operator.",
+)
+@click.option(
+    "--no-operator",
+    is_flag=True,
+    default=False,
+    help="Add nobody. Leaves managed projects visible only to the sync "
+    "identity, which is rarely what you want -- see --operator.",
+)
+@click.option(
     "--create-missing-groups",
     is_flag=True,
     default=False,
@@ -833,6 +857,9 @@ def sync_access_command(
     manifest_source: str,
     project_role: str,
     org_role: str,
+    operators: tuple[str, ...],
+    operator_role: str,
+    no_operator: bool,
     create_missing_groups: bool,
     db_host: str | None,
     db_port: int,
@@ -851,6 +878,11 @@ def sync_access_command(
     Adding an existing group to a project uses the supported API. Creating a
     group does not: Infisical gates that behind an enterprise plan, so
     --create-missing-groups writes to its database directly.
+
+    Also puts the operator on every managed project. A project created by the
+    sync identity has no human members at all -- not even the organization's
+    admins -- so without this the instance converges correctly and then looks
+    empty to the person who ran it. See --operator and --no-operator.
     """
     admin_file: Path = ctx.obj["admin_file"]
 
@@ -916,12 +948,27 @@ def sync_access_command(
         plan = _read_plan(client, organization_id)
         click.secho(f"  {plan.headline()}", fg="cyan")
 
+        # Default the operator to the admin file's own admin. Reading it is a
+        # sops call, so only do it when it will be used.
+        chosen_operators: tuple[str, ...] = ()
+        if not no_operator:
+            if operators:
+                chosen_operators = operators
+            else:
+                try:
+                    chosen_operators = (read_admin_email(admin_file),)
+                except SopsError as exc:
+                    _fail(f"could not read the admin email from {admin_file}: {exc}")
+                    return
+
         summary = run_sync_access(
             client,
             manifest,
             organization_id=organization_id,
             project_role=project_role,
             org_role=org_role,
+            operators=chosen_operators,
+            operator_role=operator_role,
             database=database,
             plan=plan,
             dry_run=dry_run,

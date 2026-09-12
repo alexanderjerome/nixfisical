@@ -806,6 +806,51 @@ class InfisicalClient:
             found[group_id] = roles[0] if roles else "?"
         return found
 
+    def list_project_users(self, project_id: str) -> dict[str, str]:
+        """Return ``{lowercased email or username: role}`` for a project's users.
+
+        Group-derived access does not appear here -- this is the direct
+        membership table only, which is exactly the question the caller has:
+        a user can hold a project through a group and still not be listed.
+        Both the email and the username are used as keys because Infisical
+        allows them to differ and the operator knows the email.
+        """
+        _, payload = self._request(
+            "GET",
+            f"/api/v1/workspace/{project_id}/memberships",
+            description="list project users",
+        )
+        found: dict[str, str] = {}
+        for membership in payload.get("memberships") or []:
+            if not isinstance(membership, dict):
+                continue
+            user = membership.get("user") or {}
+            roles = [
+                role.get("role")
+                for role in membership.get("roles") or []
+                if isinstance(role, dict) and role.get("role")
+            ]
+            role = roles[0] if roles else "?"
+            for key in (user.get("email"), user.get("username")):
+                if key:
+                    found[str(key).strip().lower()] = role
+        return found
+
+    def add_user_to_project(self, *, project_id: str, email: str, role: str) -> None:
+        """Add an existing organization member to a project with ``role``.
+
+        Despite upstream describing this route as "Invite members to project",
+        it sends no invitation for someone who is already in the organization:
+        it creates the project membership directly. It is not plan-gated -- it
+        is the same surface the UI's "Add member" button uses.
+        """
+        self._request(
+            "POST",
+            f"/api/v2/workspace/{project_id}/memberships",
+            json={"emails": [email], "roleSlugs": [role]},
+            description=f"add user to project with role {role!r}",
+        )
+
     def add_group_to_project(self, *, project_id: str, group_id: str, role: str) -> None:
         """Grant a group a role on a project.
 

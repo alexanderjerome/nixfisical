@@ -89,6 +89,7 @@ __all__ = [
     "add_org",
     "read_sync_credentials",
     "read_organization_id",
+    "read_admin_email",
     "read_admin_credentials",
     "split_file_key",
     "DEFAULT_COMMIT_MESSAGE",
@@ -182,6 +183,17 @@ def read_organization_id(admin_file: Path) -> str:
     file because that is where bootstrap recorded it.
     """
     return extract(admin_file, sops_key_expr(_KEY_ORG_ID))
+
+
+def read_admin_email(admin_file: Path) -> str:
+    """Extract just the superadmin's email address.
+
+    Deliberately separate from :func:`read_admin_credentials`: ``sync-access``
+    needs to know *who* the operator is so it can put them on the projects it
+    manages, and has no business decrypting their password to find out. An
+    email is not a credential.
+    """
+    return extract(admin_file, sops_key_expr(_KEY_ADMIN_EMAIL))
 
 
 def read_admin_credentials(admin_file: Path) -> AdminCredentials:
