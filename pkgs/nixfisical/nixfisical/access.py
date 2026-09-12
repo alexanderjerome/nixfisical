@@ -84,6 +84,7 @@ __all__ = [
     "DEFAULT_OPERATOR_ROLE",
     "SCHEMA_VERIFIED_AGAINST",
     "group_targets",
+    "manifest_projects",
     "parse_operators",
     "slugify",
     "sync_access",
@@ -261,6 +262,24 @@ def group_targets(manifest: Iterable[Mapping[str, Any]]) -> dict[str, set[str]]:
             if isinstance(group, str) and group.strip():
                 targets.setdefault(project, set()).add(group.strip())
     return targets
+
+
+def manifest_projects(manifest: Iterable[Mapping[str, Any]]) -> set[str]:
+    """Every project the manifest names, whether or not it grants a group.
+
+    Deliberately not ``group_targets(...).keys()``. The operator pass needs the
+    wider set: a project whose secrets are for nobody but the administrator has
+    no ``groups`` on any entry, and is exactly the project an operator is most
+    likely to lose. Deriving operator membership from the grant map made
+    visibility a side effect of sharing, so the projects nobody was meant to
+    share became the ones nobody could see.
+    """
+    projects: set[str] = set()
+    for entry in manifest:
+        project = entry.get("project")
+        if isinstance(project, str) and project:
+            projects.add(project)
+    return projects
 
 
 # --------------------------------------------------------------------------
@@ -569,8 +588,13 @@ def sync_access(
     the UI.
     """
     summary = AccessSummary(dry_run=dry_run)
+    manifest = list(manifest)
     targets = group_targets(manifest)
-    if not targets:
+    # Not `if not targets`. A manifest that grants no groups at all still names
+    # projects, and those projects still need their operator, so returning here
+    # on an empty grant map would skip the one pass that had work to do.
+    projects = manifest_projects(manifest)
+    if not projects:
         return summary
 
     # Parsed up front, not at the operator pass, so a malformed --operator is
@@ -745,14 +769,29 @@ def sync_access(
             summary.record("grant", target, "created", f"role {project_role}")
 
     # -- 3. operator memberships -------------------------------------------
-    # Runs over the same projects as the grant pass, so an operator ends up on
-    # exactly the projects the manifest describes and no others. Failures here
-    # are recorded and do not abort: a missing membership makes the instance
-    # hard to inspect, which is bad, but it does not make the secrets wrong.
-    for project_name in sorted(targets) if wanted_operators else ():
+    # Runs over every project the manifest names, which is a wider set than the
+    # grant pass above: that one is driven by `groups`, and a project can have
+    # none. It used to run over `targets` too, and the result was the failure
+    # this module's header describes, reached by the one route nobody checks --
+    # not a sync that never ran, but a project deliberately shared with no
+    # group, created by the sync identity, and therefore visible to no human at
+    # all. A project being private to the administrator is precisely the reason
+    # the administrator has to be on it.
+    #
+    # Failures here are recorded and do not abort: a missing membership makes
+    # the instance hard to inspect, which is bad, but it does not make the
+    # secrets wrong.
+    for project_name in sorted(projects) if wanted_operators else ():
         project_id = project_ids.get(project_name)
         if project_id is None:
-            # The grant pass already reported this project as missing.
+            if project_name in targets:
+                # The grant pass already reported this project as missing.
+                continue
+            summary.fail(
+                "membership",
+                project_name,
+                "project does not exist; run 'nixfisical sync' first",
+            )
             continue
 
         try:
