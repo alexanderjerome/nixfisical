@@ -67,6 +67,7 @@ from nixfisical.access import (
     SCHEMA_VERIFIED_AGAINST,
     AccessError,
     database_from_env,
+    parse_operators,
     sync_access as run_sync_access,
 )
 from nixfisical.api import InfisicalClient, InfisicalError
@@ -803,16 +804,20 @@ def sync_command(
     "--operator",
     "operators",
     multiple=True,
-    metavar="EMAIL",
+    metavar="EMAIL[:ROLE]",
     help="Human who should hold direct membership on every managed project. "
     "Repeatable. Defaults to the admin recorded in the admin file, because a "
-    "project created by the sync identity is visible to no human otherwise.",
+    "project created by the sync identity is visible to no human otherwise. "
+    "Append ':ROLE' to override --operator-role for that one person -- how you "
+    "give an administrator 'admin' and a developer 'viewer' in the same run. "
+    "The person must already belong to the organization: this adds them to a "
+    "project, it does not invite them to the org.",
 )
 @click.option(
     "--operator-role",
     default=DEFAULT_OPERATOR_ROLE,
     show_default=True,
-    help="Project role given to each --operator.",
+    help="Project role given to each --operator that does not name its own.",
 )
 @click.option(
     "--no-operator",
@@ -932,6 +937,16 @@ def sync_access_command(
         except (AccessError, BootstrapError, SopsError) as exc:
             _fail(str(exc), EXIT_VALIDATION)
             return
+
+    # Parse the specs the user typed before opening a connection: a mistyped
+    # `--operator dev@example.com:viwer` should cost a one-line error, not a
+    # login and a half-finished run. `sync_access` parses again, which is free
+    # and keeps it correct when called as a library rather than through here.
+    try:
+        parse_operators(operators, default_role=operator_role)
+    except AccessError as exc:
+        _fail(str(exc), EXIT_VALIDATION)
+        return
 
     with _client(ctx) as client:
         try:

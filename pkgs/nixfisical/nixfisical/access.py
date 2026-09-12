@@ -35,6 +35,15 @@ separate command:
    membership: an operator can be in ``developers``, ``developers`` can hold
    the project, and the operator still not appear in the project's member list.
 
+   Because mechanism 2 is gated and this one is not, naming people here is the
+   only way to grant a human access on an unlicensed instance -- which is every
+   instance this tool has met. That makes it the load-bearing path rather than
+   a fallback, so operators carry a role each (``EMAIL:ROLE``) and not one
+   shared role: the administrator needs `admin`, and someone being handed read
+   access must not get it. It only works for people who are already members of
+   the organization; upstream's route is described as an invitation but sends
+   none for an existing member, and does nothing for anyone else.
+
 2. **Creating the group itself** is gated: ``getDefaultOnPremFeatures()`` in
    upstream sets ``groups: false``, and ``createGroup`` refuses with "Failed to
    create group due to plan restriction" on any self-hosted instance without an
@@ -75,6 +84,7 @@ __all__ = [
     "DEFAULT_OPERATOR_ROLE",
     "SCHEMA_VERIFIED_AGAINST",
     "group_targets",
+    "parse_operators",
     "slugify",
     "sync_access",
 ]
@@ -136,6 +146,58 @@ def slugify(name: str) -> str:
     if not slug:
         raise AccessError(f"group name {name!r} does not reduce to a usable slug")
     return slug
+
+
+def parse_operators(
+    specs: Iterable[str], *, default_role: str = DEFAULT_OPERATOR_ROLE
+) -> dict[str, str]:
+    """Parse ``EMAIL`` / ``EMAIL:ROLE`` specs into ``{email: role}``.
+
+    One role for every operator stopped being enough as soon as an estate had
+    more than one kind of human on it: the person who administers the instance
+    needs `admin`, and a developer being handed read access must not get it.
+    Before this, naming both in one run gave them both the same role, and the
+    only way to differentiate was two runs with different ``--operator-role``
+    -- which cannot work, because the second run's operator pass would find the
+    first's membership already present and leave it alone.
+
+    ``:`` is the separator because it cannot appear in an address: RFC 5322
+    atext excludes it, and a domain cannot contain it either. ``=`` would have
+    been the more obvious choice and is wrong -- it *is* valid in a local part.
+    Split from the right so that the role, which is a fixed vocabulary, is the
+    part that gets peeled off.
+
+    Emails are lowercased (Infisical compares them that way and
+    ``list_project_users`` keys on the lowercased form); roles are not, because
+    a custom role slug is whatever the instance says it is.
+    """
+    parsed: dict[str, str] = {}
+    for spec in specs:
+        if not spec or not spec.strip():
+            continue
+        email, sep, role = spec.strip().rpartition(":")
+        if not sep:
+            email, role = role, default_role
+        email = email.strip().lower()
+        role = role.strip()
+        if not email:
+            raise AccessError(f"operator {spec!r} names a role but no email address")
+        if not role:
+            raise AccessError(
+                f"operator {spec!r} has an empty role; drop the ':' to use the "
+                f"default ({default_role})"
+            )
+        previous = parsed.get(email)
+        if previous is not None and previous != role:
+            # Silently keeping one of the two would grant an access level
+            # nobody asked for, in a tool whose whole job is being explicit
+            # about who can read what.
+            raise AccessError(
+                f"operator {email!r} is named twice with different roles "
+                f"({previous!r} and {role!r}); pick one"
+            )
+        parsed[email] = role
+    return parsed
 
 
 @dataclass
@@ -474,11 +536,18 @@ def sync_access(
 ) -> AccessSummary:
     """Grant every manifest group access to every project it appears in.
 
-    ``operators`` are email addresses of humans who should hold direct
-    membership on every project the manifest touches -- normally just the admin
-    from the admin file. Without this they hold nothing: see the module
-    docstring on why an org admin cannot see a synced project. Passing an empty
-    iterable skips the pass entirely and restores the previous behaviour.
+    ``operators`` are humans who should hold direct membership on every project
+    the manifest touches -- normally just the admin from the admin file.
+    Without this they hold nothing: see the module docstring on why an org
+    admin cannot see a synced project. Passing an empty iterable skips the pass
+    entirely and restores the previous behaviour.
+
+    Each entry is ``EMAIL`` or ``EMAIL:ROLE``; a bare address takes
+    ``operator_role``. The per-entry form is what lets one run grant the person
+    who administers the instance `admin` and a developer `viewer`, which a
+    single ``operator_role`` could not express -- and could not be worked
+    around with two runs, because the second would find the first's membership
+    already present and leave it alone.
 
     ``database`` is the opt-in escape hatch: when it is None, a group the
     manifest names but the instance does not have is recorded as an error
@@ -504,24 +573,31 @@ def sync_access(
     if not targets:
         return summary
 
+    # Parsed up front, not at the operator pass, so a malformed --operator is
+    # reported before anything has been written rather than after the group
+    # grants have already landed.
+    wanted_operators = parse_operators(operators, default_role=operator_role)
+
     # A built-in role is ungated; a custom one needs `rbac`. Checking here
     # rather than letting the grant fail matters because the failure would be
     # per-grant: N identical 400s, one for every project, none of which say the
-    # role is the problem.
-    if (
-        plan is not None
-        and project_role not in BUILTIN_PROJECT_ROLES
-        and not plan.allows("custom-role")
-    ):
-        summary.fail(
-            "grant",
-            project_role,
-            f"{project_role!r} is not one of the built-in project roles "
-            f"({', '.join(sorted(BUILTIN_PROJECT_ROLES))}), and this instance's "
-            "licence does not permit assigning custom roles. Every grant below "
-            "would be refused, so none were attempted.",
+    # role is the problem. Operator roles go through the same gate for the same
+    # reason -- per-operator roles made it possible to name a custom one there
+    # without ever touching --role.
+    if plan is not None and not plan.allows("custom-role"):
+        custom = sorted(
+            ({project_role} | set(wanted_operators.values())) - BUILTIN_PROJECT_ROLES
         )
-        return summary
+        if custom:
+            summary.fail(
+                "grant",
+                ", ".join(custom),
+                f"{', '.join(repr(r) for r in custom)} is not among the built-in "
+                f"project roles ({', '.join(sorted(BUILTIN_PROJECT_ROLES))}), and "
+                "this instance's licence does not permit assigning custom roles. "
+                "Every grant below would be refused, so none were attempted.",
+            )
+            return summary
 
     try:
         project_ids = client.list_projects(organization_id)
@@ -673,7 +749,6 @@ def sync_access(
     # exactly the projects the manifest describes and no others. Failures here
     # are recorded and do not abort: a missing membership makes the instance
     # hard to inspect, which is bad, but it does not make the secrets wrong.
-    wanted_operators = sorted({e.strip().lower() for e in operators if e and e.strip()})
     for project_name in sorted(targets) if wanted_operators else ():
         project_id = project_ids.get(project_name)
         if project_id is None:
@@ -688,23 +763,34 @@ def sync_access(
             )
             continue
 
-        for email in wanted_operators:
+        for email, role in sorted(wanted_operators.items()):
             target = f"{project_name}:{email}"
             if email in members:
-                summary.record("membership", target, "exists", f"role {members[email]}")
+                # Reported, not corrected. Changing the role of an existing
+                # membership is the one thing in this pass that could take
+                # access away from someone, and the module's rule is that a
+                # generated file does not get to do that. Saying what was asked
+                # for makes the drift visible without acting on it.
+                held = members[email]
+                detail = (
+                    f"role {held}"
+                    if held == role
+                    else f"role {held}, manifest asks for {role} -- not changed"
+                )
+                summary.record("membership", target, "exists", detail)
                 continue
             if dry_run:
                 summary.memberships_created += 1
-                summary.record("membership", target, "would-create", f"role {operator_role}")
+                summary.record("membership", target, "would-create", f"role {role}")
                 continue
             try:
                 client.add_user_to_project(
-                    project_id=project_id, email=email, role=operator_role
+                    project_id=project_id, email=email, role=role
                 )
             except InfisicalError as exc:
                 summary.fail("membership", target, str(exc))
                 continue
             summary.memberships_created += 1
-            summary.record("membership", target, "created", f"role {operator_role}")
+            summary.record("membership", target, "created", f"role {role}")
 
     return summary
