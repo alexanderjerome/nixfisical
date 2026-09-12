@@ -160,9 +160,9 @@
           # and means neither. A flake app is run from outside any dev shell by
           # definition, so it is the likeliest place to meet that.
         , ageKeyFile ? null
-          # The human `sync-access` puts on every project it manages, as an
-          # email. Null means "read it from the admin file", which works for an
-          # INSTANCE admin file and cannot work for a PER-ORG one: `add-org`
+          # The humans `sync-access` puts on every project it manages. Null
+          # means "read it from the admin file", which works for an INSTANCE
+          # admin file and cannot work for a PER-ORG one: `add-org`
           # deliberately omits the admin block, so there is no email in there to
           # read. A consumer syncing into its own organization on a shared
           # instance is exactly that case and must set this.
@@ -171,19 +171,65 @@
           # whose only member is the sync machine identity -- which is to say,
           # projects no human can see. That is a real choice for an unattended
           # estate and a bad surprise anywhere else.
+          #
+          # Four shapes, because on an unlicensed instance this is not just how
+          # the operator keeps visibility, it is the ONLY ungated way to give
+          # any human access at all -- group creation needs a licence, this
+          # does not. So it has to express more than one person:
+          #
+          #   operator = "admin@example.org";          one person, default role
+          #   operator = false;                        nobody
+          #   operator = [ "a@example.org" { email = "dev@example.org";
+          #                                  role  = "viewer"; } ];
+          #
+          # A list element is either a bare email (taking --operator-role) or
+          # `{ email; role; }`. The attrset is rendered to the `EMAIL:ROLE`
+          # form the CLI parses, so the parsing lives in exactly one place;
+          # a bare string is passed through, which means a literal
+          # "dev@example.org:viewer" also works if you prefer it.
+          #
+          # Everyone named must ALREADY be a member of the organization. This
+          # adds a person to a project; it does not invite them to the org.
         , operator ? null
+          # Role for any operator that does not name one. Left null to use the
+          # CLI's own default (`admin`), which is right for the person who
+          # administers the instance and wrong for everyone else -- which is
+          # why a developer should carry their own `role` rather than this
+          # being lowered fleet-wide.
+        , operatorRole ? null
           # Defaults to this flake's own build so a consumer needs neither the
           # overlay nor a matching nixpkgs. Pass `pkgs.nixfisical` if you have it.
         , nixfisical ? self.packages.${pkgs.stdenv.hostPlatform.system}.nixfisical
         }:
         let
           manifestApp = self.mkManifestApp { inherit pkgs nixosConfigurations validate; };
+          inherit (pkgs) lib;
+          # An operator entry -> the `EMAIL[:ROLE]` string the CLI parses.
+          # Rejecting an attrset without `email` here rather than emitting
+          # "null:viewer" and letting the CLI complain: the Nix call site is
+          # where the typo is, and a consumer reading a shell error out of a
+          # generated script has a much worse time finding it.
+          operatorArg = entry:
+            if builtins.isString entry then entry
+            else if builtins.isAttrs entry then
+              (if !(entry ? email) then
+                throw ("nixfisical.mkSyncApp: an `operator` attrset needs an "
+                  + "`email` field; got ${builtins.toJSON entry}")
+               else if entry ? role && entry.role != null
+               then "${entry.email}:${entry.role}"
+               else entry.email)
+            else throw ("nixfisical.mkSyncApp: `operator` list elements must be "
+              + "strings or { email; role ? null; } attrsets");
           # Only `sync-access` takes these; `sync` would reject them, which is
           # why they are baked in here rather than left to the caller's "$@".
           accessArgs =
-            if operator == null then ""
-            else if operator == false then " --no-operator"
-            else " --operator ${pkgs.lib.escapeShellArg operator}";
+            (if operator == null then ""
+             else if operator == false then " --no-operator"
+             else lib.concatMapStrings
+               (entry: " --operator ${lib.escapeShellArg (operatorArg entry)}")
+               (if builtins.isList operator then operator else [ operator ]))
+            + lib.optionalString (operatorRole != null)
+              " --operator-role ${lib.escapeShellArg operatorRole}";
         in
         pkgs.writeShellApplication {
           name = "infisical-sync";

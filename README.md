@@ -485,6 +485,53 @@ it is verified against is recorded in `access.py` as
 Run it with `--dry-run` first; it reports every group it would create and
 every grant it would make, and writes nothing.
 
+### Operator membership
+
+A project created by `sync` is visible to **nobody**. `sync` authenticates as a
+machine identity, so that identity becomes the project's admin and no human is
+a member at all — not even an organization admin. The symptom is logging into a
+freshly synced instance, seeing an empty project list, and concluding the sync
+never ran.
+
+`sync-access` therefore also puts named humans on every project the manifest
+touches. With no `--operator` it reads the email out of the admin file, which
+is right for an instance-wide admin file and impossible for a per-org one
+(`add-org` omits the admin block by design) — those must name someone.
+
+```sh
+nixfisical sync-access --operator admin@example.org           # --operator-role, default admin
+nixfisical sync-access --operator dev@example.org:viewer      # this person only
+nixfisical sync-access --no-operator                          # nobody; see below
+```
+
+**On an unlicensed instance this is the only ungated way to give a human any
+access at all.** Adding an existing group to a project is ungated, but
+*creating* the group is not, so an estate without a licence has no groups to
+add. That makes operator membership load-bearing rather than a convenience, and
+is why each entry carries its own role: the person who administers the instance
+needs `admin`, and a developer handed read access must not get it. One shared
+`--operator-role` could not express that, and two runs cannot work around it —
+the second finds the first's membership already present and leaves it alone.
+
+The `:` separator is not arbitrary. `=` is valid in an RFC 5322 local part and
+would corrupt real addresses; `:` cannot appear in one.
+
+Two limits worth knowing before you rely on it:
+
+- **The person must already be a member of the organization.** Upstream calls
+  the route "invite members to project", but it sends no invitation for an
+  existing member and does nothing for anyone else. Invite them to the org
+  first, in the UI.
+- **An existing membership is reported, never changed.** If someone holds
+  `admin` and the manifest asks for `viewer`, the run says so and moves on.
+  Access is never revoked here, and silently lowering a role on the strength of
+  a generated file is the same mistake in the other direction. Change it in the
+  UI.
+
+`--no-operator` leaves projects whose only member is the sync identity. That is
+a real choice for a genuinely unattended estate and a bad surprise anywhere
+else.
+
 ### Minting and editing secrets
 
 `secrets` is the local half of the tool. It talks to no instance — it operates
