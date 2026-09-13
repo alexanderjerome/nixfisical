@@ -6,11 +6,21 @@ Commands map onto the jobs described in the package docstring:
     nixfisical adopt       same end state, for an instance already initialised
     nixfisical add-org     same end state, for an additional organization
     nixfisical sync        converge the instance onto a manifest
+    nixfisical import      pull Infisical-owned secrets down into SOPS
     nixfisical sync-access grant manifest groups project access
     nixfisical validate    check a manifest, offline
     nixfisical status      is the instance up, and can we still log in?
     nixfisical license     which licence-gated features does it permit?
     nixfisical secrets     manage the SOPS store the manifest reads from
+
+``sync`` and ``import`` are the two directions of one manifest, not two modes
+of one command. Each entry carries a ``source`` naming which side owns its
+value; ``sync`` writes the ``"sops"`` ones and ``import`` writes the
+``"infisical"`` ones, so the sets are disjoint by construction and running both
+on a schedule cannot produce a write war. They are separate commands because
+they need different things to go right -- ``sync`` fails on a rotated-away SOPS
+key, ``import`` fails on a secret nobody created in the UI yet -- and folding
+them into one would mean one exit code for two unrelated questions.
 
 ``secrets`` is the local half of the tool and talks to no instance. It is here
 rather than in a separate binary because it operates on exactly the files the
@@ -88,6 +98,7 @@ from nixfisical.generate import GenerateError, KINDS, kind_help
 from nixfisical.license import CAPABILITIES, Plan
 from nixfisical.manifest import load as load_manifest
 from nixfisical.manifest import resolve_paths, validate as validate_manifest
+from nixfisical.pull import pull as run_pull
 from nixfisical.reconcile import reconcile as run_reconcile
 from nixfisical.sops import SopsError, extract, sops_key_expr
 from nixfisical import store as store_ops
@@ -768,6 +779,122 @@ def sync_command(
     legend = summary.legend()
     if legend:
         click.secho(legend, fg="yellow")
+    if not summary.ok:
+        sys.exit(EXIT_RUNTIME)
+
+
+# --------------------------------------------------------------------------
+# import
+# --------------------------------------------------------------------------
+
+
+@cli.command("import")
+@click.option(
+    "--manifest",
+    "manifest_source",
+    default="-",
+    show_default=True,
+    help="Path to the JSON manifest, or '-' for stdin.",
+)
+@click.option(
+    "--secrets-file",
+    default=None,
+    type=click.Path(path_type=Path),
+    help="Fallback SOPS file for manifest entries with no sopsFile of their own.",
+)
+@click.option(
+    "--root",
+    default=".",
+    show_default=True,
+    type=click.Path(path_type=Path),
+    help="Repo root that relative sopsFile paths resolve against.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Read everything, write nothing, and report which SOPS keys would be "
+    "created or updated.",
+)
+@click.pass_context
+def import_command(
+    ctx: click.Context,
+    manifest_source: str,
+    secrets_file: Path | None,
+    root: Path,
+    dry_run: bool,
+) -> None:
+    """Pull Infisical-owned secrets down into their SOPS files.
+
+    The inverse of ``sync``, over the part of the manifest ``sync`` will not
+    write: every entry declaring ``source = "infisical"``. Entries left at the
+    default ``source = "sops"`` are untouched here, exactly as these are
+    untouched there -- the two commands partition the manifest, so no secret is
+    written by both and there is no conflict to resolve.
+
+    Values land in the encrypted file at the same key the host already reads,
+    so the rest of the estate does not change: commit the result, deploy, and
+    sops-nix delivers it with `restartUnits` as it always did.
+
+    A file whose keys all already match is not rewritten, so a pull with no
+    news leaves a clean working tree.
+    """
+    admin_file: Path = ctx.obj["admin_file"]
+
+    try:
+        manifest = load_manifest(manifest_source)
+    except ValueError as exc:
+        _fail(str(exc), EXIT_VALIDATION)
+        return
+
+    problems = validate_manifest(manifest, default_secrets_file=secrets_file)
+    if problems:
+        click.secho(f"manifest has {len(problems)} problem(s):", fg="red", err=True)
+        for problem in problems:
+            click.echo(f"  - {problem}", err=True)
+        sys.exit(EXIT_VALIDATION)
+
+    manifest = resolve_paths(manifest, Path(root), default_secrets_file=secrets_file)
+
+    with _client(ctx) as client:
+        try:
+            organization_id = read_organization_id(admin_file)
+            client.universal_auth_login(read_sync_credentials(admin_file))
+        except (SopsError, InfisicalError) as exc:
+            _fail(
+                f"could not authenticate with {admin_file}: {exc}. "
+                "Run 'nixfisical status' to check the instance, or bootstrap it first."
+            )
+            return
+
+        summary = run_pull(
+            client,
+            manifest,
+            organization_id=organization_id,
+            dry_run=dry_run,
+        )
+
+    for action in summary.actions:
+        click.echo(f"  {action.render()}")
+
+    if not summary.considered:
+        # Not an error: an estate that owns all of its secrets in SOPS is the
+        # normal case and this command is a no-op for it. Say why, though --
+        # "nothing happened" plus a zeroed headline reads like a broken tool.
+        click.secho(
+            "no manifest entry declares source = \"infisical\"; nothing to import. "
+            "Mark a secret with mkInfisical { source = \"infisical\"; } to have "
+            "the instance own its value.",
+            fg="yellow",
+        )
+        return
+
+    click.secho(
+        ("DRY RUN " if dry_run else "") + summary.headline(),
+        fg="yellow" if dry_run else ("green" if summary.ok else "red"),
+    )
+    if summary.files_written and not dry_run:
+        click.echo("  review the diff and commit the changed SOPS file(s) before deploying")
     if not summary.ok:
         sys.exit(EXIT_RUNTIME)
 

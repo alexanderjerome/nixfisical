@@ -99,6 +99,41 @@ let
         '';
         example = [ "developers" ];
       };
+
+      source = mkOption {
+        type = types.enum [ "sops" "infisical" ];
+        default = "sops";
+        description = ''
+          Which side owns this secret's *value*.
+
+          `"sops"` (the default) is the normal direction: the encrypted file
+          is the source of truth and `nixfisical sync` pushes the value up.
+
+          `"infisical"` reverses it. `sync` still creates the project,
+          environment and folder, and still counts the secret as declared so
+          the prune pass leaves it alone — but it never reads the SOPS file
+          and never writes the value. `nixfisical import` goes the other way
+          and writes the instance's value into the SOPS file at this secret's
+          `key`.
+
+          Use it where the canonical copy is issued elsewhere: a provider's
+          API token a developer rotates in the UI, an OIDC client secret
+          minted by the IdP. Everything downstream is unchanged — the value
+          still reaches the host through sops-nix and `restartUnits` still
+          fires — so this moves where the value comes *from*, not how it is
+          delivered.
+
+          The direction is per secret, not per file: one encrypted file can
+          hold both kinds.
+
+          The cost is an ordering constraint. A host cannot deploy until the
+          key exists in its SOPS file, so a newly declared `"infisical"`
+          secret must be imported before the next `nixos-rebuild`, or
+          sops-nix fails the activation. That is the correct failure — a
+          missing secret should fail closed — but it means "declare, import,
+          deploy", in that order.
+        '';
+      };
     };
   };
 in

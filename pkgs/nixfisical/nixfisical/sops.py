@@ -48,7 +48,7 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import yaml
 
@@ -61,12 +61,14 @@ __all__ = [
     "sops_key_expr",
     "top_level_keys",
     "clear_cache",
+    "scalar_text",
     # write side
     "has_key",
     "leaf_keys",
     "lookup",
     "remove_key",
     "set_key",
+    "set_keys",
     "write_document",
 ]
 
@@ -230,6 +232,26 @@ def decrypt_yaml(file: Path, *, use_cache: bool = True) -> dict[str, Any]:
     return document
 
 
+def scalar_text(value: Any) -> str:
+    """Render a decrypted YAML scalar the way Infisical stores it.
+
+    Infisical stores strings and only strings, so every comparison and every
+    upload passes through here. It exists as one function because both
+    directions must agree: if the push renders YAML ``true`` as ``"true"`` and
+    the pull compares the instance's ``"true"`` against Python's ``str(True)``
+    -- which is ``"True"`` -- then a boolean secret is "changed" on every
+    single run, and ``import`` rewrites the file forever without anything
+    actually differing.
+
+    That is also why booleans are tested before the general case: ``bool`` is a
+    subclass of ``int``, so any check ordered after a numeric one silently
+    misses them.
+    """
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
 def read_key(file: Path, sops_key: str) -> str:
     """Return the value at ``sops_key`` (``a/b/c``) from ``file``, via the cache.
 
@@ -261,9 +283,7 @@ def read_key(file: Path, sops_key: str) -> str:
         raise SopsError(
             f"sops key {sops_key!r} in {file} is a collection, not a scalar"
         )
-    if isinstance(cursor, bool):
-        return "true" if cursor else "false"
-    return str(cursor)
+    return scalar_text(cursor)
 
 
 def encrypt_in_place(file: Path) -> None:
@@ -405,6 +425,110 @@ def set_key(file: Path, sops_key: str, value: str) -> str:
     )
     _forget(file)
     return "updated"
+
+
+def set_keys(file: Path, values: Mapping[str, str]) -> dict[str, str]:
+    """Write many keys into ``file`` in ONE decrypt/encrypt cycle.
+
+    Returns ``{sops_key: "created" | "updated" | "unchanged"}``, classified
+    against the file's current contents. ``import`` needs this: a pull writes a
+    whole folder at once, and the obvious loop over :func:`set_key` costs one
+    ``sops`` invocation -- and so one key unwrap, and with a hardware-backed
+    key one touch prompt -- per secret. That is the same N-round-trips problem
+    the read side was built to avoid; see the module docstring.
+
+    **When every key already matches, nothing is written at all.** sops rewrites
+    the MAC and ``lastmodified`` on every save, so an unconditional write turns
+    a no-op pull into a file-sized diff and a commit that says nothing. A
+    scheduled import should be silent when there is no news.
+
+    The cost of batching is that a write re-encrypts the whole document rather
+    than patching one value, so the diff covers every key in the file even when
+    one changed. That is already true of :func:`remove_key`, which routes
+    through :func:`write_document` for the same reason.
+
+    Plaintext never touches the disk on this path: unlike ``write_document``
+    this encrypts from stdin, and ``--filename-override`` makes sops pick the
+    ``.sops.yaml`` creation rule from the real destination. That is also what
+    lets it create a file that does not exist yet, rather than failing the way
+    ``sops --set`` does.
+    """
+    file = _write_target(file)
+    if not values:
+        return {}
+
+    document: dict[str, Any] = (
+        dict(decrypt_yaml(file, use_cache=False)) if file.is_file() else {}
+    )
+
+    verdicts: dict[str, str] = {}
+    for sops_key, value in values.items():
+        segments = _segments(sops_key)
+        cursor: Any = document
+        for depth, segment in enumerate(segments[:-1]):
+            existing = cursor.get(segment)
+            if existing is None:
+                existing = {}
+                cursor[segment] = existing
+            elif not isinstance(existing, dict):
+                # Writing "a/b/c" under a scalar "a/b" would silently discard
+                # whatever "a/b" held -- which in this file is somebody's
+                # credential. Refuse, and name the collision.
+                traversed = "/".join(segments[: depth + 1])
+                raise SopsError(
+                    f"cannot write {sops_key!r} in {file}: {traversed!r} is a "
+                    "scalar, not a mapping"
+                )
+            cursor = existing
+
+        leaf = segments[-1]
+        if leaf not in cursor:
+            verdicts[sops_key] = "created"
+        elif isinstance(cursor[leaf], (dict, list)):
+            raise SopsError(
+                f"cannot write {sops_key!r} in {file}: it currently holds a "
+                "collection, not a scalar"
+            )
+        elif scalar_text(cursor[leaf]) == value:
+            verdicts[sops_key] = "unchanged"
+        else:
+            verdicts[sops_key] = "updated"
+        cursor[leaf] = value
+
+    if all(verdict == "unchanged" for verdict in verdicts.values()):
+        return verdicts
+
+    file.parent.mkdir(parents=True, exist_ok=True)
+    ciphertext = _run(
+        ["sops", "--encrypt", "--filename-override", str(file), "/dev/stdin"],
+        context=f"writing {len(values)} key(s) to {file}",
+        stdin=yaml.safe_dump(document, default_flow_style=False, sort_keys=False),
+        cwd=file.parent,
+    )
+
+    # Staged and renamed rather than written in place: this path REPLACES an
+    # existing store, so a truncate that fails halfway destroys every secret in
+    # the file, not just the ones being written. What lands in the staging file
+    # is ciphertext, so unlike `write_document` there is no plaintext window.
+    handle = tempfile.NamedTemporaryFile(
+        mode="w",
+        dir=file.parent,
+        prefix=f".{file.name}.",
+        suffix=file.suffix or ".yaml",
+        delete=False,
+    )
+    staging = Path(handle.name)
+    try:
+        with handle:
+            handle.write(ciphertext)
+        os.replace(staging, file)
+        staging = None  # type: ignore[assignment]
+    finally:
+        if staging is not None and staging.exists():
+            staging.unlink()
+
+    _forget(file)
+    return verdicts
 
 
 def write_document(file: Path, document: dict[str, Any]) -> None:
