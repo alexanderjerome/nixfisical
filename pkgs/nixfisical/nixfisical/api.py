@@ -864,3 +864,52 @@ class InfisicalClient:
             json={"roles": [{"role": role, "isTemporary": False}]},
             description=f"add group to project with role {role!r}",
         )
+
+    def list_project_identities(self, project_id: str) -> dict[str, str]:
+        """Return ``{identity id: role}`` for the machine identities on a project.
+
+        The mirror of :meth:`list_project_users` for the other kind of
+        principal. Keyed by id rather than name because identity names are not
+        unique in Infisical -- a name lookup can only tell you that *an*
+        identity is called that, which is not the question a membership check
+        is asking.
+        """
+        _, payload = self._request(
+            "GET",
+            f"/api/v2/workspace/{project_id}/identity-memberships",
+            description="list project identities",
+        )
+        found: dict[str, str] = {}
+        for membership in payload.get("identityMemberships") or []:
+            if not isinstance(membership, dict):
+                continue
+            identity = membership.get("identity") or {}
+            identity_id = identity.get("id") or membership.get("identityId")
+            if not identity_id:
+                continue
+            roles = [
+                role.get("role")
+                for role in membership.get("roles") or []
+                if isinstance(role, dict) and role.get("role")
+            ]
+            found[str(identity_id)] = roles[0] if roles else "?"
+        return found
+
+    def add_identity_to_project(
+        self, *, project_id: str, identity_id: str, role: str
+    ) -> None:
+        """Grant a machine identity a role on a project.
+
+        This is what makes a least-privilege host identity possible. An
+        identity created with the organization role ``admin`` -- which is what
+        ``bootstrap`` mints for ``fleet-sync`` -- reaches every project in the
+        organization without any membership at all, so a host identity is
+        created with ``no-access`` instead and reaches exactly the projects it
+        is added to here.
+        """
+        self._request(
+            "POST",
+            f"/api/v2/workspace/{project_id}/identity-memberships/{identity_id}",
+            json={"role": role},
+            description=f"add identity to project with role {role!r}",
+        )

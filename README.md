@@ -22,7 +22,10 @@ Postgres — see [docs/native.md](docs/native.md).
 
 ## The idea
 
-SOPS stays the source of truth. Each secret says, at its declaration site,
+SOPS stays the source of truth — with one deliberate exception per secret
+(["Secrets Infisical owns"](#secrets-infisical-owns)) and one deliberate
+exception per host (["Direct injection"](#direct-injection-experimental)). Each
+secret says, at its declaration site,
 whether developers should see it and where it belongs:
 
 ```nix
@@ -240,11 +243,13 @@ updated, and **deleted**. Run it first.
 | `nixosModules.export` | Adds `sops.secrets.<key>.infisical`. |
 | `nixosModules.server` | Runs a self-hosted instance. |
 | `nixosModules.default` | Both of the above. |
+| `nixosModules.inject` | Fetches this host's secrets from Infisical at boot. Experimental; **not** in `default`. |
 | `packages.nixfisical` | The `nixfisical` CLI. |
+| `packages.nixfisical-agent` | The host half of `nixosModules.inject`, without the CLI or its closure. |
 | `packages.infisical-backend` | The Infisical API, built from source. No web UI. |
 | `packages.infisical-frontend` | The Infisical web UI, as static files. |
 | `packages.infisical-standalone` | Both, with the API serving the UI. |
-| `overlays.default` | Puts all four in your package set. |
+| `overlays.default` | Puts all of the packages in your package set. |
 
 Wiring the manifest app into a consumer flake:
 
@@ -419,6 +424,7 @@ nixfisical add-org       same end state, for an additional organization
 nixfisical sync          converge the instance onto a manifest
 nixfisical import        pull instance-owned values down into their SOPS files
 nixfisical sync-access   grant manifest groups access to their projects
+nixfisical provision-host mint a host's own scoped identity into its SOPS file
 nixfisical validate      check a manifest offline (exit 2 on problems)
 nixfisical status        is it reachable, and does the sync identity still work
 nixfisical secrets       read, write and mint the SOPS values the rest reads
@@ -725,9 +731,124 @@ one case that needs it — pasting a bootstrap password into a UI once. It is
 not for scripts; those should use `secrets get`, which reads the store rather
 than racing it.
 
+## Direct injection (experimental)
+
+Everything above keeps SOPS in the path: Infisical is a view, sops-nix does the
+delivery, and a rotated value reaches a host on its next deploy. `nixosModules.inject`
+is the other arrangement — the host authenticates to the instance itself and
+writes the values straight into a tmpfs, no SOPS file involved.
+
+It is a **different trust model, not a better one**, and the three differences
+are the whole reason it is opt-in per host:
+
+- **The host holds a credential that can read.** sops-nix gives it a key that
+  only decrypts what it was already handed; this gives it an identity that can
+  *ask* for anything that identity may read. A compromised host is now a read of
+  its whole blast radius, which is why `provision-host` scopes that identity as
+  narrowly as the API allows.
+- **Boot depends on the network.** An unreachable instance becomes a failure to
+  start. That fails closed, which is the right direction, but it puts the
+  secrets server in the boot path of everything downstream of it.
+- **Rotation stops needing a deploy.** This is the point. A value changed in the
+  UI reaches the host on the next agent run, and only the units whose input
+  actually changed are restarted.
+
+It does not remove SOPS and cannot: the host needs credentials to authenticate
+with, and those arrive by sops-nix like everything else. What changes is the
+count — **one SOPS-delivered credential per host** instead of one per secret.
+
+### Give the host an identity
+
+```sh
+nixfisical --url https://infisical.example.com provision-host alpha \
+  --project platform --project databases \
+  --into secrets/alpha.yaml
+```
+
+This creates a machine identity `host-alpha` with the organization role
+`no-access`, adds it to each named project as `viewer`, mints universal-auth
+credentials, and writes them into `secrets/alpha.yaml` under
+`infisical/client_id` and `infisical/client_secret`. The org role matters:
+`bootstrap` mints `fleet-sync` as an org `admin`, which reaches every project in
+the organization, and an identity shaped like that on a host is a host that can
+read the whole fleet.
+
+Re-running is safe and mints nothing — an identity that already has credentials
+keeps them, because a re-mint writes a new client secret into SOPS while the
+running host still holds the old one, and nothing fails until the next deploy.
+`--rotate` is how you ask for a new pair on purpose. If the destination file
+will not decrypt, the command stops rather than guessing: a file it cannot read
+is indistinguishable from one with no credentials in it.
+
+### Declare what the host fetches
+
+```nix
+{
+  imports = [ nixfisical.nixosModules.inject ];   # not in nixosModules.default
+
+  services.nixfisical.inject = {
+    enable = true;
+    url = "https://infisical.example.com";
+    organizationId = "…";
+    identity.clientIdFile     = config.sops.secrets."infisical/client_id".path;
+    identity.clientSecretFile = config.sops.secrets."infisical/client_secret".path;
+    refreshInterval = "hourly";
+
+    secrets."grafana-oidc" = {
+      project = "platform";
+      folder  = "/grafana";
+      name    = "OIDC_CLIENT_SECRET";
+      owner   = "grafana";
+      group   = "grafana";
+      restartUnits = [ "grafana.service" ];
+    };
+  };
+}
+```
+
+That places the value at `/run/nixfisical/grafana-oidc`, owned `grafana:grafana`
+mode `0400`, and restarts `grafana.service` only when the value **actually
+changes** — not when the store path moves, and never for a unit that was
+deliberately stopped. `refreshInterval` is what makes "rotate without a deploy"
+reach the host unattended; without it the agent runs at boot and on demand only.
+
+The spec the module generates is world-readable in the store and carries
+coordinates, destinations and ownership but **no values** — the same bargain
+sops-nix's manifest makes. Folder and secret names are visible to any local
+user.
+
+This module and `nixosModules.export` are not alternatives. A secret SOPS owns
+and Infisical mirrors is what the export path is for; one Infisical owns and
+this host reads is what this is for; both can be true on one host.
+
+### The cache trade
+
+`cache.enable` keeps the fetched values on disk and serves them when the
+instance cannot be reached. **It writes secret values to disk in plaintext**,
+giving back the one property the direct path otherwise has over SOPS-at-rest,
+so it is off by default — that choice should be made, not inherited.
+
+It is usually worth making. Without it, a host that reboots during an instance
+outage comes up without the secrets its services need, and one outage becomes an
+outage of everything downstream. With it, the same reboot serves values that may
+be stale, and the agent prints a loud `DEGRADED` line on every run that used the
+cache, because a fleet quietly running on month-old secrets is the failure this
+could otherwise produce silently.
+
+`packages.nixfisical-agent` is the host half: the same source as `nixfisical`
+without the operator CLI, and without the `sops` and `git` closure that wrapping
+it would drag onto every host (219 MiB against 445 MiB). The module picks it by
+default.
+
 ## What it does not do yet
 
 **Folder pruning.** Secrets are pruned; empty folders are left behind.
+
+**Direct injection is unproven.** It evaluates, its Python is covered, and the
+generated spec round-trips through the real agent binary — but nothing has run
+it against a live instance on a real host, and there is no VM test. Treat the
+first host as an experiment, and keep its secrets in SOPS until it has survived
+a reboot.
 
 ## Roadmap
 
@@ -737,6 +858,9 @@ than racing it.
 - A NixOS VM test covering bootstrap → sync → prune end to end, and one
   covering the `native` units against a live Postgres — they are currently
   verified by evaluation only.
+- A NixOS VM test for the injection agent: boot with a reachable instance, boot
+  with an unreachable one and no cache (must fail closed), and boot with an
+  unreachable one and a cache (must come up degraded and say so).
 
 ## Prior art
 

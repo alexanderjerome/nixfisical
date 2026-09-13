@@ -23,6 +23,10 @@
         # Add `sops.secrets.<key>.infisical` so secrets can be annotated for
         # export. Import this on every host you want to export from.
         export = ./nix/modules/export.nix;
+        # EXPERIMENTAL, and not in `default` for that reason. Fetch this host's
+        # secrets from the instance at boot instead of through sops-nix. A
+        # different trust model, not a better one -- see the module header.
+        inject = ./nix/modules/inject.nix;
       };
 
       overlays.default = final: prev:
@@ -33,6 +37,14 @@
         in
         {
           nixfisical = final.callPackage ./nix/pkgs/nixfisical.nix { };
+
+          # The same source, built for the hosts rather than the operator: the
+          # agent alone, with neither sops nor git in its closure. A fleet that
+          # injects directly would otherwise carry the operator's tooling on
+          # every machine.
+          nixfisical-agent = final.callPackage ./nix/pkgs/nixfisical.nix {
+            minimal = true;
+          };
 
           # The API, the web UI, and the two joined so the API serves the UI.
           # Separate because the API is useful alone and the UI is cheap to
@@ -303,6 +315,9 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
         nixfisical = pkgs.callPackage ./nix/pkgs/nixfisical.nix { };
+        nixfisical-agent = pkgs.callPackage ./nix/pkgs/nixfisical.nix {
+          minimal = true;
+        };
         infisicalSource = pkgs.callPackage ./nix/pkgs/infisical-source.nix { };
         infisical-backend = pkgs.callPackage ./nix/pkgs/infisical-backend.nix {
           inherit infisicalSource;
@@ -317,7 +332,7 @@
       in
       {
         packages = {
-          inherit nixfisical bump-infisical
+          inherit nixfisical nixfisical-agent bump-infisical
             infisical-backend infisical-frontend infisical-standalone;
           default = nixfisical;
         };
