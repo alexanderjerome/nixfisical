@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from nixfisical.api import InfisicalClient, InfisicalError
+from nixfisical.manifest import entry_source
 from nixfisical.sops import SopsError, read_key
 
 __all__ = ["Action", "ReconcileSummary", "reconcile", "folder_ancestors"]
@@ -38,8 +39,12 @@ class Action:
 
     ``kind`` is the object type (``project``/``environment``/``folder``/
     ``secret``/``prune``), ``target`` its coordinate, ``result`` one of
-    ``created``/``updated``/``exists``/``deleted``/``would-*``/``skipped``/
-    ``error``.
+    ``created``/``updated``/``exists``/``deleted``/``delegated``/``would-*``/
+    ``skipped``/``error``.
+
+    ``delegated`` is the one that means "correctly did nothing": the entry
+    declares ``source = "infisical"``, so its value is not this command's to
+    write. ``skipped``, by contrast, means something was in the way.
     """
 
     kind: str
@@ -64,6 +69,11 @@ class ReconcileSummary:
     secrets_created: int = 0
     secrets_updated: int = 0
     secrets_pruned: int = 0
+    # Declared `source = "infisical"`: structure reconciled, value left to the
+    # instance. Counted separately and never folded into created/updated,
+    # because "sync touched 40 secrets" and "sync touched 31 and deliberately
+    # did not touch 9" are different reports.
+    secrets_delegated: int = 0
     groups_seen: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     actions: list[Action] = field(default_factory=list)
@@ -93,6 +103,16 @@ class ReconcileSummary:
     def ok(self) -> bool:
         return not self.errors
 
+    @property
+    def _delegated_clause(self) -> str:
+        """``, delegated N`` -- or nothing at all when the estate has none.
+
+        Suppressed at zero on purpose. Most fleets will never set
+        `source = "infisical"`, and a counter that is always `0` teaches
+        everyone reading the headline to stop reading it.
+        """
+        return f", delegated {self.secrets_delegated}" if self.secrets_delegated else ""
+
     def headline(self) -> str:
         if self.dry_run:
             # `+` where the run knows, `~` where it would write without knowing
@@ -105,14 +125,16 @@ class ReconcileSummary:
                 f"environments ~{self.environments_planned}, "
                 f"folders ~{self.folders_planned}, "
                 f"secrets ~{self.secrets_planned}, "
-                f"pruned -{self.secrets_pruned}, errors {len(self.errors)}"
+                f"pruned -{self.secrets_pruned}{self._delegated_clause}, "
+                f"errors {len(self.errors)}"
             )
         return (
             f"applied: projects +{self.projects_created}, "
             f"environments +{self.environments_created}, "
             f"folders +{self.folders_created}, "
             f"secrets +{self.secrets_created}/~{self.secrets_updated}, "
-            f"pruned -{self.secrets_pruned}, errors {len(self.errors)}"
+            f"pruned -{self.secrets_pruned}{self._delegated_clause}, "
+            f"errors {len(self.errors)}"
         )
 
     def legend(self) -> str:
@@ -299,6 +321,25 @@ def reconcile(
     # -- 5. secrets --------------------------------------------------------
     for entry in entries:
         target = _coordinate(entry)
+
+        # An Infisical-owned secret gets its structure from this run and its
+        # value from nobody. The folder above was created for it, the prune
+        # pass below counts it as declared and so leaves it alone, and its
+        # groups are in `groups_seen` for `sync-access` -- everything except
+        # the one step that would overwrite the copy the instance owns.
+        #
+        # Its SOPS file is deliberately not opened, not even to check. A
+        # freshly declared Infisical-owned secret has no SOPS key yet (that is
+        # what `import` is for), and a `sync` that failed because the pull had
+        # not run yet would make the two commands ordering-dependent in the
+        # one direction that has no reason to be.
+        if entry_source(entry) == "infisical":
+            summary.secrets_delegated += 1
+            summary.record(
+                "secret", target, "delegated", "source=infisical; run 'import' to pull it"
+            )
+            continue
+
         sops_file = entry.get("sopsFile")
         if not sops_file:
             summary.fail(

@@ -46,6 +46,10 @@ A secret with no `infisical` block is infra-only: it stays in SOPS and never
 reaches Infisical. Exporting is opt-in per secret, because a fleet's SOPS file
 is full of things developers must not see.
 
+SOPS is the default source of truth, not the only one: a secret the instance
+mints rather than receives says `source = "infisical"` and travels the other
+way. See [Secrets Infisical owns](#secrets-infisical-owns).
+
 Importing `nixosModules.export` costs one deploy. sops-nix serialises the
 whole secret submodule into its on-host `manifest.json`, unknown fields and
 all, so `"infisical": null` appears against every secret as soon as the module
@@ -128,6 +132,73 @@ it. `mkSyncApp` takes the same argument.
 Use it for secrets no host can honestly declare, not as a shortcut around
 annotating one that can: an export-only entry has no `restartUnits`, no
 rotation path through a deploy, and nothing tying it to the thing that uses it.
+
+### Secrets Infisical owns
+
+Some values are not yours to author. An OIDC client secret is minted by the
+identity provider, a webhook signing key is shown once by the SaaS that issues
+it, a developer rotates a shared API token in the UI at 2am. SOPS can hold
+those — it has to, because the host needs them — but it did not produce them,
+and a `sync` that pushes the local copy up will quietly overwrite the real one.
+
+Say so at the declaration site:
+
+```nix
+sops.secrets."services/grafana/oidc_secret" = {
+  restartUnits = [ "grafana.service" ];
+
+  infisical = nixfisical.lib.mkInfisical {
+    project = "platform";
+    folder  = "/grafana";
+    name    = "OIDC_CLIENT_SECRET";
+    source  = "infisical";          # defaults to "sops"
+  };
+};
+```
+
+`source` names which side owns the **value**. Everything else about the entry
+is unchanged: it is still in the manifest, still gets its project, environment
+and folder created, still gets its group access applied, and — importantly —
+is still *declared*, so `sync --prune` leaves it alone rather than deleting a
+secret it has been told not to write.
+
+What changes is who writes what:
+
+```
+sync    writes the values of  source = "sops"       entries. Never the others.
+import  writes the values of  source = "infisical"  entries, into their SOPS files.
+```
+
+The two write sets are disjoint by construction, which is the whole safety
+argument. There is no bidirectional sync here and no conflict resolution,
+because no secret is ever written by both commands. A pull cannot clobber a
+rotation you just pushed, and a `sync` run from a stale checkout cannot undo a
+value it never had.
+
+```sh
+# Pull every instance-owned value down into the SOPS files that hold it.
+nix run .#infisical-manifest | nixfisical --url https://infisical.example.com import --dry-run
+nix run .#infisical-manifest | nixfisical --url https://infisical.example.com import
+```
+
+`import` decrypts and rewrites each destination file **once**, not once per
+secret — a token-backed age key asks for one touch per file, not one per
+value. A value that already matches is not written at all: an import with no
+news leaves every file byte-identical, so a changed file in `git status` means
+something actually changed. Review the diff and commit it; nothing is pushed
+for you.
+
+**The ordering constraint.** sops-nix reads the file, not the instance, so a
+host cannot deploy a secret that is not in its SOPS file yet. A newly declared
+`source = "infisical"` entry therefore goes **declare → import → deploy**, in
+that order. Import before the entry exists in Infisical and the run fails
+naming the coordinate; deploy before the import and activation fails with a
+missing key. Both fail closed, which is correct, but the order is not optional.
+
+`import` and `sync` stay separate commands rather than one converge step
+because they can fail for unrelated reasons — the instance being unreachable
+versus a SOPS file you cannot decrypt — and folding them together would mean
+one exit code answering two questions.
 
 ## Quick start
 
@@ -346,6 +417,7 @@ nixfisical bootstrap     initialise a fresh instance, record creds in SOPS
 nixfisical adopt         same, for an instance that is already initialised
 nixfisical add-org       same end state, for an additional organization
 nixfisical sync          converge the instance onto a manifest
+nixfisical import        pull instance-owned values down into their SOPS files
 nixfisical sync-access   grant manifest groups access to their projects
 nixfisical validate      check a manifest offline (exit 2 on problems)
 nixfisical status        is it reachable, and does the sync identity still work

@@ -14,8 +14,16 @@ An entry looks like::
       "folder":      "/mainnet",
       "name":        "RPC_PASSWORD",
       "groups":      ["developers"],
-      "hosts":       ["btc-mainnet"]
+      "hosts":       ["btc-mainnet"],
+      "source":      "sops"
     }
+
+``source`` is the entry's *direction*, and it is what stops the two commands
+that read this file from fighting over the same secret. ``reconcile`` writes
+the value of a ``"sops"`` entry and refuses to touch an ``"infisical"`` one;
+``pull`` does the exact opposite. An entry is therefore written by one of
+them, never both. It is optional and defaults to ``"sops"``, so a manifest
+rendered before the field existed still means what it always meant.
 
 ``sopsFile`` being per-entry is the principal improvement over the Ansible
 role, which had one global ``infisical_secrets_file``. Secrets in a real estate
@@ -35,7 +43,21 @@ import sys
 from pathlib import Path
 from typing import Any, Iterable
 
-__all__ = ["REQUIRED_FIELDS", "load", "validate", "resolve_paths", "entry_label"]
+__all__ = [
+    "REQUIRED_FIELDS",
+    "SOURCES",
+    "load",
+    "validate",
+    "resolve_paths",
+    "entry_label",
+    "entry_source",
+]
+
+# Which side owns an entry's value. ``sops`` is the original and still the
+# default direction: the encrypted file is the truth and ``sync`` pushes it up.
+# ``infisical`` reverses it for that one secret -- ``sync`` stops writing the
+# value, ``import`` starts writing the SOPS file.
+SOURCES: tuple[str, ...] = ("sops", "infisical")
 
 # Fields every entry must carry. ``sopsFile`` is deliberately absent: it may be
 # supplied per entry or fall back to a global default, so it is checked
@@ -64,6 +86,23 @@ def entry_label(entry: dict[str, Any], index: int) -> str:
     if isinstance(key, str) and key:
         return f"entry[{index}] sopsKey={key!r}"
     return f"entry[{index}]"
+
+
+def entry_source(entry: dict[str, Any]) -> str:
+    """Which side owns this entry's value, defaulting to ``"sops"``.
+
+    The default is what makes a manifest rendered by an older Nix side -- one
+    with no ``source`` in it at all -- keep working: every entry in it was
+    SOPS-owned, because that was the only thing an entry could be.
+
+    Validation rejects an unrecognised value rather than letting this function
+    quietly map it to the default, because defaulting a typo'd ``"Infisical"``
+    to ``"sops"`` hands the next ``sync`` permission to overwrite the
+    instance's copy. That check lives in :func:`validate`; here the value is
+    assumed already checked.
+    """
+    value = entry.get("source")
+    return value if isinstance(value, str) and value else "sops"
 
 
 def load(source: str | Path) -> list[dict[str, Any]]:
@@ -152,6 +191,15 @@ def validate(
             problems.append(
                 f"{label}: no sopsFile and no --secrets-file default; "
                 f"cannot resolve a value for sopsKey {sops_key!r}"
+            )
+
+        source = entry.get("source")
+        if source is not None and (
+            not isinstance(source, str) or source not in SOURCES
+        ):
+            problems.append(
+                f"{label}: source {source!r} must be one of "
+                f"{', '.join(repr(name) for name in SOURCES)} (absent means 'sops')"
             )
 
         for field in ("groups", "hosts"):

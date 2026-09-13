@@ -222,21 +222,24 @@
             if builtins.isString entry then entry
             else if builtins.isAttrs entry then
               (if !(entry ? email) then
-                throw ("nixfisical.mkSyncApp: an `operator` attrset needs an "
+                throw
+                  ("nixfisical.mkSyncApp: an `operator` attrset needs an "
                   + "`email` field; got ${builtins.toJSON entry}")
-               else if entry ? role && entry.role != null
-               then "${entry.email}:${entry.role}"
-               else entry.email)
-            else throw ("nixfisical.mkSyncApp: `operator` list elements must be "
+              else if entry ? role && entry.role != null
+              then "${entry.email}:${entry.role}"
+              else entry.email)
+            else
+              throw ("nixfisical.mkSyncApp: `operator` list elements must be "
               + "strings or { email; role ? null; } attrsets");
           # Only `sync-access` takes these; `sync` would reject them, which is
           # why they are baked in here rather than left to the caller's "$@".
           accessArgs =
             (if operator == null then ""
-             else if operator == false then " --no-operator"
-             else lib.concatMapStrings
-               (entry: " --operator ${lib.escapeShellArg (operatorArg entry)}")
-               (if builtins.isList operator then operator else [ operator ]))
+            else if operator == false then " --no-operator"
+            else
+              lib.concatMapStrings
+                (entry: " --operator ${lib.escapeShellArg (operatorArg entry)}")
+                (if builtins.isList operator then operator else [ operator ]))
             + lib.optionalString (operatorRole != null)
               " --operator-role ${lib.escapeShellArg operatorRole}";
         in
@@ -461,6 +464,22 @@
                       folder = "/mealie";
                     };
                   };
+                  # Owned by the instance, not by SOPS. Identical in every
+                  # other respect to the entries above -- which is the point:
+                  # it is an ordinary manifest entry that `sync` declines to
+                  # write the value of and `import` writes into SOPS. If the
+                  # field ever stops reaching the manifest, `sync` starts
+                  # pushing the local copy over the IdP's and the only symptom
+                  # is an OIDC login that stops working.
+                  "services/grafana/oidc_secret" = {
+                    sopsFile = "/fleet/secrets/platform.yaml";
+                    infisical = nixfisicalLib.mkInfisical {
+                      project = "platform";
+                      folder = "/grafana";
+                      name = "OIDC_CLIENT_SECRET";
+                      source = "infisical";
+                    };
+                  };
                   # Unannotated: must never appear in the manifest.
                   "internal/root_key" = { sopsFile = "/fleet/secrets/dbs.yaml"; };
                 });
@@ -534,6 +553,7 @@
                   project = "apps";
                   sopsFile = "/fleet/secrets/api.yaml";
                   sopsKey = "services/api/token";
+                  source = "sops";
                 }
                 {
                   environment = "prod";
@@ -544,6 +564,7 @@
                   project = "apps";
                   sopsFile = "/fleet/secrets/cli-proxy.yaml";
                   sopsKey = "api_key";
+                  source = "sops";
                 }
                 {
                   environment = "prod";
@@ -554,6 +575,7 @@
                   project = "databases";
                   sopsFile = "/fleet/secrets/dbs.yaml";
                   sopsKey = "dbs/main/password";
+                  source = "sops";
                 }
                 {
                   environment = "prod";
@@ -564,6 +586,7 @@
                   project = "databases";
                   sopsFile = "/fleet/secrets/infra-db.yaml";
                   sopsKey = "mealie";
+                  source = "sops";
                 }
                 {
                   environment = "prod";
@@ -574,6 +597,22 @@
                   project = "platform";
                   sopsFile = "/fleet/secrets/mail-clients.yaml";
                   sopsKey = "mail.engine_password";
+                  source = "sops";
+                }
+                # The one entry the instance owns. Its presence here is what
+                # pins `source` to the manifest: drop the field from the
+                # plumbing and this entry reads "sops" like every other one,
+                # and `sync` starts overwriting a value it did not author.
+                {
+                  environment = "prod";
+                  folder = "/grafana";
+                  groups = [ ];
+                  hosts = [ "alpha" ];
+                  name = "OIDC_CLIENT_SECRET";
+                  project = "platform";
+                  sopsFile = "/fleet/secrets/platform.yaml";
+                  sopsKey = "services/grafana/oidc_secret";
+                  source = "infisical";
                 }
               ];
             in

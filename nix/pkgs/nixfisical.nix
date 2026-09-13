@@ -36,12 +36,21 @@ python3Packages.buildPythonApplication rec {
 
   nativeBuildInputs = [ makeWrapper ];
 
-  # The suite is deliberately offline-only: no server, no SOPS key, no network.
-  # It covers the handful of pure functions whose failure mode is silent rather
-  # than loud — an admin block landing in the wrong estate's file, a find rule
-  # drifting from the create rule and minting a duplicate organization on every
-  # run. Anything needing a live instance is not a check, it is an operation.
-  nativeCheckInputs = [ python3Packages.pytestCheckHook ];
+  # The suite is deliberately offline-only: no server, no network. It covers
+  # the handful of functions whose failure mode is silent rather than loud — an
+  # admin block landing in the wrong estate's file, a find rule drifting from
+  # the create rule and minting a duplicate organization on every run. Anything
+  # needing a live instance is not a check, it is an operation.
+  #
+  # `sops` is here for exactly one suite. `set_keys` REPLACES an encrypted file
+  # holding an estate's secrets, and its dangerous outcomes — a store that no
+  # longer decrypts, or one quietly missing the keys this run did not write —
+  # are invisible to a test that stubs sops out, because the risk lives in the
+  # part the stub replaces. It runs against a throwaway age key in a tmpdir, so
+  # it is still offline. The suite skips itself when sops is absent, which is
+  # why this line is load-bearing: without it the tests do not fail, they
+  # silently stop running.
+  nativeCheckInputs = [ python3Packages.pytestCheckHook sops ];
 
   postFixup = ''
     wrapProgram $out/bin/nixfisical \
@@ -58,6 +67,7 @@ python3Packages.buildPythonApplication rec {
     "nixfisical.bootstrap"
     "nixfisical.generate"
     "nixfisical.license"
+    "nixfisical.pull"
     "nixfisical.reconcile"
     "nixfisical.store"
   ];

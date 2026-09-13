@@ -17,6 +17,12 @@
 # decrypted ever enters the Nix store. The `nixfisical sync` CLI takes this
 # manifest plus your age key and does the decryption at run time, on the
 # operator's machine.
+#
+# Each entry also carries `source`, naming which side owns its value. The
+# manifest therefore describes both directions at once: `sync` reads the
+# `source = "sops"` entries and pushes them up, `import` reads the
+# `source = "infisical"` ones and writes them down. One declaration, two
+# commands, and no secret that both of them write.
 { lib }:
 
 rec {
@@ -31,14 +37,21 @@ rec {
   #       groups  = [ "developers" ];
   #     };
   #   };
+  #
+  # `source` names which side owns the VALUE, and defaults to the direction
+  # this repo was built around: SOPS is the truth, Infisical is the view.
+  # Setting it to "infisical" reverses that for one secret -- `sync` stops
+  # writing the value and `import` starts writing the SOPS file. See the
+  # option's description in nix/modules/export.nix for the full contract.
   mkInfisical =
     { project
     , folder ? "/"
     , environment ? "prod"
     , name ? null
     , groups ? [ ]
+    , source ? "sops"
     }: {
-      inherit project folder environment name groups;
+      inherit project folder environment name groups source;
     };
 
   # Export a secret that NO host declares.
@@ -66,6 +79,13 @@ rec {
   # declaration and the next sync deletes the secret from Infisical. The
   # sopsFile must still be decryptable by whoever runs the sync — the entry
   # asserts nothing about who can read it, only where it goes.
+  # `source` works here exactly as it does on `mkInfisical`, and is arguably
+  # more at home: a credential with no host behind it is often one a person
+  # was handed rather than one the estate generated, which is the case
+  # `source = "infisical"` describes. Note that an export-only entry has no
+  # NixOS module validating the field, so `assertManifest` is the only thing
+  # standing between a typo here and a manifest the CLI silently treats as
+  # SOPS-owned.
   mkExportOnly =
     { sopsFile
     , sopsKey
@@ -74,8 +94,9 @@ rec {
     , environment ? "prod"
     , name ? null
     , groups ? [ ]
+    , source ? "sops"
     }: {
-      inherit sopsKey project folder environment groups;
+      inherit sopsKey project folder environment groups source;
       sopsFile = toString sopsFile;
       host = null;
       name = if name != null then name else lib.last (lib.splitString "/" sopsKey);
@@ -128,6 +149,13 @@ rec {
                   else null;
                 inherit host;
                 inherit (e) project environment folder groups;
+                # `or` rather than `inherit`: the module gives `source` a
+                # default, so a config that went through it always has one.
+                # This is for the caller who hands `manifestFrom` a hand-built
+                # attrset -- a test, or a consumer assembling entries without
+                # the module. Absent means the direction this repo started
+                # with, which is also what keeps older callers working.
+                source = e.source or "sops";
                 # Default the Infisical-side name to the last segment of the
                 # SOPS key: "services/bitcoin/rpc_password" -> "rpc_password".
                 name = if e.name != null then e.name else lib.last (lib.splitString "/" sopsKey);
@@ -185,6 +213,18 @@ rec {
       # the CLI as a lookup that cannot be phrased, let alone explained.
       emptyKey = lib.filter (e: e.sopsKey == "") manifest;
 
+      # The one field whose wrong value is silent rather than loud. A bad
+      # `project` 404s and a bad `environment` is caught above, but an entry
+      # reading `source = "Infisical"` (or "remote", or "pull") is a
+      # well-formed manifest that every tool here will treat as SOPS-owned --
+      # so the next `sync` pushes the local value over the instance's, which
+      # is the exact accident the field exists to prevent. The module's enum
+      # catches this for host-derived entries; nothing catches it for
+      # `mkExportOnly` or a hand-built one, so it is caught here.
+      badSource = lib.filter
+        (e: !(lib.elem (e.source or "sops") [ "sops" "infisical" ]))
+        manifest;
+
       # Two entries writing the same Infisical coordinate: one wins, and which
       # one depends on manifest ordering. `nixfisical validate` catches this
       # too, but only once the manifest has been rendered and handed to the
@@ -216,7 +256,8 @@ rec {
         ++ (err "environment slugs must match [a-z0-9-]+" badEnv)
         ++ (err "folder paths must be absolute (start with /)" badFolder)
         ++ (errBy "whole-file secrets (key = \"\") cannot be exported; name a key" emptyKey)
-        ++ (errBy "two secrets declared into the same Infisical destination" dupDest);
+        ++ (errBy "two secrets declared into the same Infisical destination" dupDest)
+        ++ (err "source must be \"sops\" or \"infisical\"" badSource);
     in
     if problems == [ ]
     then manifest
