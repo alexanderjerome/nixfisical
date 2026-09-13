@@ -8,6 +8,7 @@ Commands map onto the jobs described in the package docstring:
     nixfisical sync        converge the instance onto a manifest
     nixfisical import      pull Infisical-owned secrets down into SOPS
     nixfisical sync-access grant manifest groups project access
+    nixfisical provision-host  mint a host's own identity for direct injection
     nixfisical validate    check a manifest, offline
     nixfisical status      is the instance up, and can we still log in?
     nixfisical license     which licence-gated features does it permit?
@@ -98,6 +99,8 @@ from nixfisical.generate import GenerateError, KINDS, kind_help
 from nixfisical.license import CAPABILITIES, Plan
 from nixfisical.manifest import load as load_manifest
 from nixfisical.manifest import resolve_paths, validate as validate_manifest
+from nixfisical.provision import HostCredentials
+from nixfisical.provision import provision_host as run_provision_host
 from nixfisical.pull import pull as run_pull
 from nixfisical.reconcile import reconcile as run_reconcile
 from nixfisical.sops import SopsError, extract, sops_key_expr
@@ -895,6 +898,130 @@ def import_command(
     )
     if summary.files_written and not dry_run:
         click.echo("  review the diff and commit the changed SOPS file(s) before deploying")
+    if not summary.ok:
+        sys.exit(EXIT_RUNTIME)
+
+
+# --------------------------------------------------------------------------
+# provision-host
+# --------------------------------------------------------------------------
+
+
+@cli.command("provision-host")
+@click.argument("host")
+@click.option(
+    "--project",
+    "projects",
+    multiple=True,
+    required=True,
+    help="Project this host may read. Repeat for each one; the host gets "
+    "read-only access to exactly these and nothing else.",
+)
+@click.option(
+    "--into",
+    "destination_file",
+    required=True,
+    type=click.Path(path_type=Path),
+    help="SOPS file the host's credentials are written into. It is the file "
+    "sops-nix delivers to this host.",
+)
+@click.option(
+    "--client-id-key",
+    default="infisical/client_id",
+    show_default=True,
+    help="Key within the SOPS file for the universal-auth client id.",
+)
+@click.option(
+    "--client-secret-key",
+    default="infisical/client_secret",
+    show_default=True,
+    help="Key within the SOPS file for the universal-auth client secret.",
+)
+@click.option(
+    "--rotate",
+    is_flag=True,
+    default=False,
+    help="Mint fresh credentials even if the SOPS file already holds a pair. "
+    "The running host keeps working until its next deploy.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Report what would be created and granted; create nothing.",
+)
+@click.pass_context
+def provision_host_command(
+    ctx: click.Context,
+    host: str,
+    projects: tuple[str, ...],
+    destination_file: Path,
+    client_id_key: str,
+    client_secret_key: str,
+    rotate: bool,
+    dry_run: bool,
+) -> None:
+    """Give HOST its own machine identity for direct injection.
+
+    Creates ``host-HOST`` with the organization role ``no-access``, grants it
+    read-only access to each ``--project``, mints universal-auth credentials,
+    and writes them into ``--into`` so sops-nix can deliver them.
+
+    This is the bootstrap that direct injection cannot do for itself: the host
+    needs a credential to ask for secrets, and that credential has to arrive
+    some other way. Direct injection does not remove SOPS -- it reduces it to
+    one credential per host.
+
+    Converges. A second run creates nothing, grants nothing already granted,
+    and leaves existing credentials alone: re-minting would write a new client
+    secret into SOPS while the running host still holds the old one, and the
+    host would keep working until its next deploy and then fail to
+    authenticate.
+    """
+    admin_file: Path = ctx.obj["admin_file"]
+
+    with _client(ctx) as client:
+        try:
+            organization_id = read_organization_id(admin_file)
+            client.universal_auth_login(read_sync_credentials(admin_file))
+        except (SopsError, InfisicalError) as exc:
+            _fail(
+                f"could not authenticate with {admin_file}: {exc}. "
+                "Run 'nixfisical status' to check the instance, or bootstrap it first."
+            )
+            return
+
+        summary = run_provision_host(
+            client,
+            host=host,
+            organization_id=organization_id,
+            projects=projects,
+            destination=HostCredentials(
+                sops_file=destination_file,
+                client_id_key=client_id_key,
+                client_secret_key=client_secret_key,
+            ),
+            rotate=rotate,
+            dry_run=dry_run,
+        )
+
+    for action in summary.actions:
+        click.echo(f"  {action}")
+    for problem in summary.errors:
+        click.secho(f"  error: {problem}", fg="red", err=True)
+
+    click.secho(
+        ("DRY RUN " if dry_run else "") + summary.headline(),
+        fg="yellow" if dry_run else ("green" if summary.ok else "red"),
+    )
+    if summary.minted_credentials and not dry_run:
+        click.echo(
+            f"  commit {destination_file}, then point the host at it:\n"
+            f"    services.nixfisical.inject.identity.clientIdFile ="
+            f" config.sops.secrets.\"{client_id_key}\".path;\n"
+            f"    services.nixfisical.inject.identity.clientSecretFile ="
+            f" config.sops.secrets.\"{client_secret_key}\".path;"
+        )
     if not summary.ok:
         sys.exit(EXIT_RUNTIME)
 

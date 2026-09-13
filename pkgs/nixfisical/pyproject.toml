@@ -25,6 +25,11 @@ dependencies = [
 
 [project.scripts]
 nixfisical = "nixfisical.cli:cli"
+# The host-side agent. A separate entry point because it is a separate
+# audience: `nixfisical` runs on an operator's machine and needs sops and git,
+# the agent runs on every host that injects directly and must not drag either
+# of them into that host's closure. See `minimal` in nix/pkgs/nixfisical.nix.
+nixfisical-agent = "nixfisical.agent:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
