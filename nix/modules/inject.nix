@@ -152,6 +152,30 @@ let
   unaddressed = lib.attrNames (lib.filterAttrs
     (_: secret: secret.project == null && secret.projectId == null)
     cfg.secrets);
+
+  # Shared by the boot unit and the refresh unit, which differ only in
+  # `RemainAfterExit` and in what starts them.
+  agentService = {
+    Type = "oneshot";
+    ExecStart = lib.escapeShellArgs ([
+      "${cfg.package}/bin/nixfisical-agent"
+      "--spec"
+      "${spec}"
+      "--client-id-file"
+      "${cfg.identity.clientIdFile}"
+      "--client-secret-file"
+      "${cfg.identity.clientSecretFile}"
+    ] ++ lib.optionals cfg.cache.enable [ "--cache" cfg.cache.directory ]);
+
+    # Runs as root: it chowns files to arbitrary service users and reads a
+    # sops-nix secret that is root-only. Hardening it into a DynamicUser
+    # would require handing back exactly those two capabilities.
+    User = "root";
+    # A boot-blocking unit that retries forever is a host that never
+    # finishes booting. One attempt, fail closed, and the timer (or an
+    # operator) tries again.
+    Restart = "no";
+  };
 in
 {
   options.services.nixfisical.inject = {
@@ -330,34 +354,38 @@ in
       # network is not up — so this is the boundary that exists.
       before = [ "multi-user.target" ];
 
-      serviceConfig = {
-        Type = "oneshot";
+      serviceConfig = agentService // {
         # The placed secrets are the unit's output and they outlive the
         # process. Without this, a `systemctl status` on a correctly-working
         # host says "inactive (dead)", and ordering against it means nothing.
         RemainAfterExit = true;
-        ExecStart = lib.escapeShellArgs ([
-          "${cfg.package}/bin/nixfisical-agent"
-          "--spec"
-          "${spec}"
-          "--client-id-file"
-          "${cfg.identity.clientIdFile}"
-          "--client-secret-file"
-          "${cfg.identity.clientSecretFile}"
-        ] ++ lib.optionals cfg.cache.enable [ "--cache" cfg.cache.directory ]);
-
-        # Runs as root: it chowns files to arbitrary service users and reads a
-        # sops-nix secret that is root-only. Hardening it into a DynamicUser
-        # would require handing back exactly those two capabilities.
-        User = "root";
-        # A boot-blocking unit that retries forever is a host that never
-        # finishes booting. One attempt, fail closed, and the timer (or an
-        # operator) tries again.
-        Restart = "no";
       };
     };
 
-    systemd.timers.nixfisical-agent = mkIf (cfg.refreshInterval != null) {
+    # The refresh runs the agent again rather than restarting the unit above,
+    # and it is a separate unit for a reason that is easy to get wrong: a
+    # `Type=oneshot` service with `RemainAfterExit=true` is `active (exited)`,
+    # and a start job on an already-active unit returns -EALREADY and runs
+    # nothing. A timer pointed straight at `nixfisical-agent.service` would
+    # therefore fire on schedule, log success, and never fetch anything — the
+    # "rotation without a deploy" headline, silently doing nothing.
+    #
+    # `systemctl restart nixfisical-agent.service` would work, but restarts
+    # propagate: anything with `Requires=nixfisical-agent.service` restarts
+    # too, every hour, which is the opposite of only restarting a consumer
+    # whose value actually changed. So the refresh invokes the agent directly
+    # and lets the agent's own change detection decide what to restart.
+    systemd.services.nixfisical-agent-refresh = mkIf (cfg.refreshInterval != null) {
+      description = "Re-fetch this host's secrets from Infisical";
+      after = [ "network-online.target" ];
+      wants = [ "network-online.target" ];
+      # Deliberately no wantedBy: this unit is started by its timer and by
+      # nothing else. It is also the right thing to `systemctl start` by hand
+      # to pull a rotation down now.
+      serviceConfig = agentService;
+    };
+
+    systemd.timers.nixfisical-agent-refresh = mkIf (cfg.refreshInterval != null) {
       description = "Re-fetch this host's secrets from Infisical";
       wantedBy = [ "timers.target" ];
       timerConfig = {
