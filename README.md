@@ -812,6 +812,19 @@ changes** — not when the store path moves, and never for a unit that was
 deliberately stopped. `refreshInterval` is what makes "rotate without a deploy"
 reach the host unattended; without it the agent runs at boot and on demand only.
 
+Two units, which is worth knowing before you go looking for one:
+`nixfisical-agent.service` is the boot unit — `RemainAfterExit`, so ordering
+against it means something — and `nixfisical-agent-refresh.service` is what the
+timer starts, and what to `systemctl start` by hand to pull a rotation down now.
+They cannot be one unit: a start job on an already-active oneshot returns
+`-EALREADY` and runs nothing, so a timer aimed at the boot unit would fire on
+schedule, log success, and never fetch a thing.
+
+Consumers should order against the boot unit with `Wants=` + `After=`, not
+`Requires=`: a restart propagates to everything that requires the unit, which
+would undo the point of restarting only on a real change. Order against it, and
+make the consumer fail closed on a missing file on its own.
+
 The spec the module generates is world-readable in the store and carries
 coordinates, destinations and ownership but **no values** — the same bargain
 sops-nix's manifest makes. Folder and secret names are visible to any local
