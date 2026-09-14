@@ -29,6 +29,16 @@
         inject = ./nix/modules/inject.nix;
       };
 
+      homeManagerModules = {
+        default = ./nix/modules/hm-agent.nix;
+        # Upstream's Infisical agent as a `systemd.user` service: templates
+        # rendered from the instance into the developer's own tree, re-rendered
+        # when a secret changes. Deliberately home-manager only -- a polling
+        # daemon is the right answer on a laptop and the wrong one on a server,
+        # where `nixosModules.inject` fetches once at boot instead.
+        agent = ./nix/modules/hm-agent.nix;
+      };
+
       overlays.default = final: prev:
         let
           # Not exposed as an attribute: it is a version pin and two helper
@@ -393,6 +403,206 @@
             # contract, and this is what exercises it.
             ageKeyFile = "\${XDG_CONFIG_HOME:-$HOME/.config}/sops/age/keys.txt";
           };
+
+          # Evaluate the home-manager agent module standalone and assert the
+          # YAML it hands the upstream binary.
+          #
+          # Standalone because home-manager is not an input here and should
+          # not become one for a module that only borrows two of its options.
+          # The stub below declares exactly those two, which is also the
+          # module's whole contract with home-manager -- if that grows, this
+          # check is what notices.
+          #
+          # The thing being defended is narrow and worth naming: every key in
+          # that YAML is a Go struct tag, and a wrong one does not fail. It
+          # unmarshals to the zero value and the agent runs happily doing
+          # slightly less than you asked. `exec` for `execute` is the version
+          # of this that upstream's own documentation ships.
+          hm-agent =
+            let
+              hmStub = { lib, ... }: {
+                options.systemd.user.services = lib.mkOption {
+                  type = lib.types.attrsOf (lib.types.attrsOf lib.types.anything);
+                  default = { };
+                };
+                options.assertions = lib.mkOption {
+                  type = lib.types.listOf lib.types.unspecified;
+                  default = [ ];
+                };
+              };
+
+              eval = extra: (nixpkgs.lib.evalModules {
+                modules = [
+                  ./nix/modules/hm-agent.nix
+                  hmStub
+                  { _module.args.pkgs = pkgs; }
+                ] ++ extra;
+              }).config;
+
+              base = {
+                enable = true;
+                address = "https://infisical.invalid";
+                auth.clientIdFile = "/home/dev/.config/infisical/client-id";
+                auth.clientSecretFile = "/home/dev/.config/infisical/client-secret";
+              };
+
+              good = eval [{
+                programs.nixfisical.agent = base // {
+                  projects.work = {
+                    projectId = "abc-123";
+                    templates = {
+                      backend = {
+                        dotenv.enable = true;
+                        dotenv.secretPath = "/backend";
+                        destination = "/home/dev/src/api/.env";
+                        onChange = "true";
+                      };
+                      # A raw template, to pin that both forms reach the agent
+                      # the same way and that a template without `onChange`
+                      # emits no `execute` block at all rather than an empty
+                      # one -- an empty command is a shell invocation of "",
+                      # every polling interval, forever.
+                      other = {
+                        content = "static\n";
+                        destination = "/home/dev/src/api/other.conf";
+                        mode = "0644";
+                      };
+                    };
+                  };
+                };
+              }];
+
+              # Every assertion that would fire, for a config. Home-manager
+              # evaluates these itself; here they are just a list, so the
+              # check reads the list.
+              failing = c: nixpkgs.lib.filter (a: !a.assertion) c.assertions;
+
+              twoSources = failing (eval [{
+                programs.nixfisical.agent = base // {
+                  projects.work = {
+                    projectId = "abc-123";
+                    templates.both = {
+                      dotenv.enable = true;
+                      content = "also this\n";
+                      destination = "/home/dev/.env";
+                    };
+                  };
+                };
+              }]);
+
+              sharedDestination = failing (eval [{
+                programs.nixfisical.agent = base // {
+                  projects.work = {
+                    projectId = "abc-123";
+                    templates.a = { content = "a\n"; destination = "/home/dev/.env"; };
+                    templates.b = { content = "b\n"; destination = "/home/dev/.env"; };
+                  };
+                };
+              }]);
+
+              noTemplates = failing (eval [{
+                programs.nixfisical.agent = base;
+              }]);
+
+              # An enabled module with a valid config must produce a clean
+              # assertion list. Without this the three checks above pass just
+              # as well against a module that asserts on everything.
+              goodIsClean = failing good == [ ];
+
+              execStart = good.systemd.user.services.nixfisical-agent.Service.ExecStart;
+            in
+            pkgs.runCommand "nixfisical-hm-agent-check"
+              { nativeBuildInputs = [ pkgs.yq-go ]; }
+              (nixpkgs.lib.optionalString (!goodIsClean) ''
+                echo "a valid agent config produced failing assertions:" >&2
+                echo ${nixpkgs.lib.escapeShellArg
+                  (builtins.toJSON (map (a: a.message) (failing good)))} >&2
+                exit 1
+              '' + nixpkgs.lib.optionalString (twoSources == [ ]) ''
+                echo "a template setting both dotenv and content was accepted" >&2
+                exit 1
+              '' + nixpkgs.lib.optionalString (sharedDestination == [ ]) ''
+                echo "two templates sharing a destination were accepted" >&2
+                exit 1
+              '' + nixpkgs.lib.optionalString (noTemplates == [ ]) ''
+                echo "an enabled agent with no templates was accepted" >&2
+                exit 1
+              '' + ''
+                execstart=${nixpkgs.lib.escapeShellArg execStart}
+                case "$execstart" in
+                  *" agent --config "*) ;;
+                  *) echo "ExecStart is not an agent invocation: $execstart" >&2
+                     exit 1 ;;
+                esac
+                config="''${execstart##* --config }"
+
+                get() { yq -o=json -I=0 "$1" "$config"; }
+
+                check() {
+                  actual=$(get "$1")
+                  if [ "$actual" != "$2" ]; then
+                    echo "$1: expected $2, got $actual" >&2
+                    exit 1
+                  fi
+                }
+
+                check '.infisical.address' '"https://infisical.invalid"'
+                check '.infisical.exit-after-auth' 'false'
+                # Absent, not null: `maxRetries` is unset, and an emitted
+                # `retry-strategy` with zero retries is not the same as
+                # leaving upstream's strategy alone.
+                check '.infisical | has("retry-strategy")' 'false'
+
+                check '.auth.type' '"universal-auth"'
+                check '.auth.config.client-id' '"/home/dev/.config/infisical/client-id"'
+                check '.auth.config.client-secret' '"/home/dev/.config/infisical/client-secret"'
+                # Underscores. Upstream's one inconsistent struct tag, and a
+                # hyphenated spelling here would silently never remove it.
+                check '.auth.config.remove_client_secret_on_read' 'false'
+
+                check '.sinks | length' '0'
+                check '.templates | length' '2'
+
+                env=$(get '.templates[] | select(.destination-path == "/home/dev/src/api/.env")')
+                other=$(get '.templates[] | select(.destination-path == "/home/dev/src/api/other.conf")')
+
+                [ "$(printf '%s' "$env" | yq -o=json -I=0 '.config.execute.command')" = '"true"' ] \
+                  || { echo "dotenv template lost its execute.command" >&2; exit 1; }
+                [ "$(printf '%s' "$env" | yq -o=json -I=0 '.config.execute.timeout')" = '30' ] \
+                  || { echo "dotenv template lost its execute.timeout" >&2; exit 1; }
+                [ "$(printf '%s' "$env" | yq -o=json -I=0 '.config.polling-interval')" = '"60s"' ] \
+                  || { echo "dotenv template lost its polling-interval" >&2; exit 1; }
+                [ "$(printf '%s' "$other" | yq -o=json -I=0 '.config | has("execute")')" = 'false' ] \
+                  || { echo "a template with no onChange emitted an execute block" >&2; exit 1; }
+
+                # Both forms are source-path; neither is inlined into the YAML.
+                for t in "$env" "$other"; do
+                  [ "$(printf '%s' "$t" | yq -o=json -I=0 'has("source-path")')" = 'true' ] \
+                    || { echo "a template was not handed over as source-path" >&2; exit 1; }
+                done
+
+                dotenv=$(printf '%s' "$env" | yq -o=json -I=0 -r '.source-path')
+                # The generated template is the contract with Infisical's
+                # template engine: the function name, the argument order, and
+                # the modifier's JSON keys are all theirs, and all silent when
+                # wrong -- a misspelled modifier key unmarshals to `false`.
+                grep -qF 'listSecrets "abc-123" "dev" "/backend"' "$dotenv" \
+                  || { echo "dotenv template does not call listSecrets as expected:" >&2
+                       cat "$dotenv" >&2; exit 1; }
+                grep -qF '{"expandSecretReferences":true,"recursive":false}' "$dotenv" \
+                  || { echo "dotenv template modifier is not what Infisical parses:" >&2
+                       cat "$dotenv" >&2; exit 1; }
+                # No blank line between pairs. Without the `{{-` trimming each
+                # directive leaves its own newline behind and some dotenv
+                # parsers stop at the first blank line.
+                grep -qF '{{- range . }}' "$dotenv" \
+                  || { echo "dotenv template lost its whitespace trimming" >&2; exit 1; }
+
+                [ "$(cat "$(printf '%s' "$other" | yq -o=json -I=0 -r '.source-path')")" = 'static' ] \
+                  || { echo "inline content did not survive the round trip" >&2; exit 1; }
+
+                echo ok > $out
+              '');
 
           # Evaluate the export module standalone and assert the manifest
           # walk produces what we expect: the name defaulting, the per-secret
