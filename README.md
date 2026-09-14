@@ -251,6 +251,8 @@ updated, and **deleted**. Run it first.
 | `packages.infisical-backend` | The Infisical API, built from source. No web UI. |
 | `packages.infisical-frontend` | The Infisical web UI, as static files. |
 | `packages.infisical-standalone` | Both, with the API serving the UI. |
+| `packages.docs` | Every option and every CLI command, generated. See "The agent surface". |
+| `apps.mcp` | An MCP server over a live instance. Read-only by default. |
 | `overlays.default` | Puts all of the packages in your package set. |
 
 Wiring the manifest app into a consumer flake:
@@ -1144,6 +1146,75 @@ in the store.
 The agent reads `INFISICAL_UNIVERSAL_AUTH_CLIENT_ID` from the environment in
 preference to the file, so an exported variable silently wins over the
 configuration.
+
+## The agent surface
+
+Three pieces, split by whether the question needs a running instance. The split
+is the design: the common questions need nothing, and making them need a
+process would be a worse answer to them.
+
+**`nix build .#docs`** — every option the modules declare and every command the
+CLI has, generated from the module system and the click tree. No process, no
+credentials, no network, and it cannot drift from what it documents: an option
+added without a description is a hole visible in the output, and a renamed one
+moves in the same commit. Emits `options.{json,md}`, `commands.{json,md}` and an
+`index.md`. `nixfisical docs --format json` prints the command half alone.
+
+It is also a `check`, and the only one that evaluates every module's options
+tree — every `default`, every `example`. That is a class of breakage nothing
+else here would notice.
+
+**`nix run .#mcp`** — an MCP server over stdio, for what is true of an instance
+*right now*: `instance_status`, `license`, `list_projects`,
+`list_secret_names`, `validate_manifest`, `sync_diff`, `access_diff`,
+`keyring_audit`.
+
+```json
+{
+  "mcpServers": {
+    "nixfisical": {
+      "command": "nix",
+      "args": [
+        "run", "github:jeirslab/nixfisical#mcp", "--",
+        "--url", "https://infisical.example",
+        "--admin-file", "secrets/infisical-admin.yaml"
+      ]
+    }
+  }
+}
+```
+
+Two properties it is built around. **No tool returns a secret value** — names,
+coordinates, versions, counts and drift, never material. The enforcement is a
+whitelist of the fields that come through rather than a blacklist of the ones
+that do not, because a blacklist is one upstream field addition away from a
+leak, and the leak would be silent and into a transcript.
+
+And it **writes nothing** unless started with `--allow-writes`, which adds
+exactly one tool. `sync_apply` then still refuses unless the caller passes the
+deletion count `sync_diff` reported for the same manifest against the same
+instance. `sync` prunes; a boolean confirmation is one an agent passes every
+time, and a number it can only get by having looked is one it cannot.
+
+It authenticates as `fleet-sync`, never as the superadmin, and it is removed
+from the `minimal` build along with the CLI — a host does not need to be able to
+answer questions about the other hosts.
+
+The protocol is hand-written rather than taken from the official SDK. That SDK
+brings pydantic, starlette, uvicorn and an SSE stack — a web server — into the
+closure of a tool whose transport here is a pipe; measured at ~250 MiB
+standalone, against four JSON-RPC methods. If this ever needs HTTP, resources,
+prompts or sampling, that trade flips.
+
+**`.claude/skills/operate/`** — the operating procedure: the ordering and the
+blast radii. `sync` prunes; `sync` before `sync-access`; `source` decides
+direction and a misspelled key reads as SOPS-owned; the keyring project must
+never appear in the manifest; group creation is licence-gated. Skills load
+path-qualified from a workspace root, which the other two do not — an MCP
+server configured inside a repo is inert unless the session was launched there.
+
+`AGENTS.md` at the root points at all three, for a consumer who has this as a
+flake input and no checkout.
 
 ## What it does not do yet
 
