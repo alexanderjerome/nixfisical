@@ -9,6 +9,7 @@ Commands map onto the jobs described in the package docstring:
     nixfisical import      pull Infisical-owned secrets down into SOPS
     nixfisical sync-access grant manifest groups project access
     nixfisical provision-host  mint a host's own identity for direct injection
+    nixfisical keyring     store age and SSH keys, and audit who reads them
     nixfisical validate    check a manifest, offline
     nixfisical status      is the instance up, and can we still log in?
     nixfisical license     which licence-gated features does it permit?
@@ -104,6 +105,7 @@ from nixfisical.provision import provision_host as run_provision_host
 from nixfisical.pull import pull as run_pull
 from nixfisical.reconcile import reconcile as run_reconcile
 from nixfisical.sops import SopsError, extract, sops_key_expr
+from nixfisical import keyring as keyring_ops
 from nixfisical import store as store_ops
 
 EXIT_OK = 0
@@ -123,6 +125,22 @@ def _read_sops_ref(spec: str, secrets_file: Path | None, *, what: str) -> str:
     """Resolve a ``FILE:KEY`` or bare-``KEY`` option into a decrypted value."""
     file, key = split_file_key(spec, secrets_file, what=what)
     return extract(file, sops_key_expr(key))
+
+
+def _default_age_key_file() -> Path:
+    """The age key file ``keyring push`` uploads when none is named.
+
+    The same file :func:`_resolve_age_key` hands to sops, and for the same
+    reason: an operator who keeps a key at the conventional path means that
+    key. ``SOPS_AGE_KEY`` -- the inline form -- is deliberately not consulted.
+    This uploads a *file*, comments and all, and reconstructing one from an
+    environment variable would drop exactly the ``# public key:`` lines that
+    let ``keyring audit`` name a recipient without decrypting anything.
+    """
+    from_env = os.environ.get("SOPS_AGE_KEY_FILE")
+    if from_env:
+        return Path(from_env).expanduser()
+    return Path.home() / ".ssh" / "sops-age.key"
 
 
 def _read_plan(client: InfisicalClient, organization_id: str) -> Plan:
@@ -1024,6 +1042,311 @@ def provision_host_command(
         )
     if not summary.ok:
         sys.exit(EXIT_RUNTIME)
+
+
+# --------------------------------------------------------------------------
+# keyring
+# --------------------------------------------------------------------------
+
+
+@cli.group("keyring")
+def keyring_group() -> None:
+    """Store key material in Infisical, and audit who can read it.
+
+    The one place this tool moves key material *into* the instance rather than
+    a value the instance is a view of. An age key cannot come from a SOPS file,
+    because it is the thing that opens SOPS files, so getting one onto a fresh
+    host is a job nothing else here does.
+
+    SSH keys live here too, for a different reason: Infisical's SSH certificate
+    authority was removed from the product, and what replaced it is behind a
+    licence. So an SSH key on a self-hosted instance is a secret with a
+    placement policy -- which is what a keyring entry already was.
+
+    It does not remove the bootstrap problem, it shrinks it. A host still needs
+    a credential before it can pull anything; what changes is that the
+    credential is one small per-host file encrypted to an age identity the host
+    derived from its own SSH host key -- ``sops.age.sshKeyPaths`` -- rather than
+    the central key that decrypts the whole estate. Read
+    ``nixfisical/keyring.py``'s module docstring before wiring this into a
+    bootstrap; the ordering is the part that bricks a host if it is wrong.
+
+    The keyring project must **not** appear in the manifest. ``sync-access``
+    puts the manifest's groups on every project it names, and a group grant
+    here hands the estate's master key to everyone in that group without
+    anybody deciding to. ``keyring audit`` is what notices.
+    """
+
+
+@keyring_group.command("push")
+@click.argument("name")
+@click.option(
+    "--from-file",
+    "key_file",
+    default=None,
+    type=click.Path(path_type=Path),
+    help="Key file to upload, verbatim. Defaults to the same age key this tool "
+    "decrypts with: SOPS_AGE_KEY_FILE, then ~/.ssh/sops-age.key.",
+)
+@click.option(
+    "--type",
+    "key_type",
+    type=click.Choice(["auto", *sorted(keyring_ops.TYPES)]),
+    default="auto",
+    show_default=True,
+    help="What kind of key this is. 'auto' sniffs the file, which is reliable "
+    "-- bech32 lines and PEM armour are not confusable. Naming it explicitly "
+    "buys a specific error instead of 'cannot tell what this is'.",
+)
+@click.option(
+    "--public-from-file",
+    "public_file",
+    default=None,
+    type=click.Path(path_type=Path),
+    help="Store this as the public half instead of deriving it. Use the sidecar "
+    "'.pub': it carries the comment, which is what makes an authorized_keys "
+    "entry identifiable later. Required for a PEM-format key, whose public half "
+    "cannot be computed without RSA/EC arithmetic.",
+)
+@click.option(
+    "--project",
+    default=keyring_ops.DEFAULT_PROJECT,
+    show_default=True,
+    help="Project to keep keyring entries in. One project is one blast radius: "
+    "a host granted access reads every entry, not only its own.",
+)
+@click.option(
+    "--install-path",
+    default=None,
+    help="Where a host installs this key. Stored in the instance so it lives in "
+    "one place rather than in every host's configuration. Defaults to the type's "
+    f"own: {keyring_ops.AGE.default_path} for age, "
+    f"{keyring_ops.SSH.default_path} for ssh.",
+)
+@click.option(
+    "--install-public-path",
+    default=None,
+    help="Where the public half goes, for the types that install one. Defaults "
+    "to the install path plus '.pub'.",
+)
+@click.option(
+    "--install-owner",
+    default=keyring_ops.DEFAULT_OWNER,
+    show_default=True,
+    help="Owner of the installed key file.",
+)
+@click.option(
+    "--install-group",
+    default=keyring_ops.DEFAULT_GROUP,
+    show_default=True,
+    help="Group of the installed key file.",
+)
+@click.option(
+    "--install-mode",
+    default=None,
+    help="Mode of the installed private key. Anything readable beyond the owner "
+    "is refused, whatever the type. Defaults to the type's own: "
+    f"{keyring_ops.AGE.default_mode} for age, {keyring_ops.SSH.default_mode} for "
+    "ssh. The public half's mode is not settable -- it comes from the type.",
+)
+@click.option(
+    "--replace",
+    is_flag=True,
+    default=False,
+    help="Overwrite an entry that already holds a key. Every host that has "
+    "pulled the old one decrypts with it, and the breakage surfaces at their "
+    "next activation, not here.",
+)
+@click.option(
+    "--no-operator",
+    is_flag=True,
+    default=False,
+    help="Do not add the superadmin to the keyring project. The project is then "
+    "visible to nobody in the UI, which is a decision, not an oversight.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Report what would be stored; store nothing.",
+)
+@click.pass_context
+def keyring_push_command(
+    ctx: click.Context,
+    name: str,
+    key_file: Path | None,
+    key_type: str,
+    public_file: Path | None,
+    project: str,
+    install_path: str | None,
+    install_public_path: str | None,
+    install_owner: str,
+    install_group: str,
+    install_mode: str | None,
+    replace: bool,
+    no_operator: bool,
+    dry_run: bool,
+) -> None:
+    """Upload a key and its placement policy as keyring entry NAME.
+
+    The file is stored verbatim, comments and all, because an age key file may
+    hold several keys -- which is how a rekeying happens without a flag day --
+    and re-serialising it would quietly drop the ones after the first. The same
+    applies to an OpenSSH key, whose armour is load-bearing.
+
+    It is validated first, in pure Python, so the same check runs on the host at
+    install time: an age key against its bech32 checksum, an SSH key by parsing
+    its ``openssh-key-v1`` container. A truncated paste produces a key that looks
+    right and works for nothing.
+
+    Create-only unless ``--replace``. The project is created if it does not
+    exist and the superadmin is added to it, because a project created through
+    the API is visible to nobody -- org admins included.
+    """
+    admin_file: Path = ctx.obj["admin_file"]
+    source = Path(key_file) if key_file else _default_age_key_file()
+    try:
+        key_text = source.read_text()
+    except OSError as exc:
+        _fail(
+            f"cannot read {source}: {exc}. Name the key with --from-file, or set "
+            "SOPS_AGE_KEY_FILE."
+        )
+        return
+
+    try:
+        material = (
+            keyring_ops.detect(key_text)
+            if key_type == "auto"
+            else keyring_ops.material_named(key_type)
+        )
+    except keyring_ops.KeyringError as exc:
+        _fail(str(exc))
+        return
+
+    public_text = None
+    if public_file is not None:
+        try:
+            public_text = Path(public_file).read_text()
+        except OSError as exc:
+            _fail(f"cannot read {public_file}: {exc}")
+            return
+
+    placement = keyring_ops.Placement.for_material(
+        material,
+        path=install_path,
+        owner=install_owner,
+        group=install_group,
+        mode=install_mode,
+        public_path=install_public_path,
+    )
+
+    with _client(ctx) as client:
+        try:
+            organization_id = read_organization_id(admin_file)
+            operator_email = None if no_operator else read_admin_email(admin_file)
+            client.universal_auth_login(read_sync_credentials(admin_file))
+        except (SopsError, InfisicalError) as exc:
+            _fail(f"could not authenticate with {admin_file}: {exc}")
+            return
+
+        summary = keyring_ops.push(
+            client,
+            name=name,
+            key_text=key_text,
+            organization_id=organization_id,
+            operator_email=operator_email,
+            project=project,
+            material=material,
+            placement=placement,
+            public_override=public_text,
+            replace=replace,
+            dry_run=dry_run,
+        )
+
+    for action in summary.actions:
+        click.echo(f"  {action}")
+    for note in summary.notes:
+        click.secho(f"  note: {note}", fg="yellow", err=True)
+    for problem in summary.errors:
+        click.secho(f"  error: {problem}", fg="red", err=True)
+    if summary.kinds:
+        click.echo(f"  contains: {', '.join(summary.kinds)}")
+    for line in summary.public:
+        click.echo(f"  public: {line}")
+
+    click.secho(
+        ("DRY RUN " if dry_run else "") + summary.headline(),
+        fg="yellow" if dry_run else ("green" if summary.ok else "red"),
+    )
+    if summary.ok and not dry_run:
+        click.echo(
+            f"  grant a host: nixfisical provision-host <host> --project {project}"
+            f" --into <sops file>\n"
+            f"  then on the host: nixfisical-keyring-install --name {name}"
+            f" --url {ctx.obj['url']} --organization-id <id> \\\n"
+            f"      --client-id-file <path> --client-secret-file <path>"
+        )
+    if not summary.ok:
+        sys.exit(EXIT_RUNTIME)
+
+
+@keyring_group.command("audit")
+@click.option(
+    "--project",
+    default=keyring_ops.DEFAULT_PROJECT,
+    show_default=True,
+    help="Keyring project to inspect.",
+)
+@click.pass_context
+def keyring_audit_command(ctx: click.Context, project: str) -> None:
+    """Report who can read the keyring, and warn about anything unexpected.
+
+    "Visible only to the superadmin" is a claim, and a claim about access
+    control that nothing checks is one that stops being true quietly. Exits 0
+    with warnings rather than failing: a second operator is legitimate, and the
+    job here is to make sure it was a decision.
+    """
+    admin_file: Path = ctx.obj["admin_file"]
+    with _client(ctx) as client:
+        try:
+            organization_id = read_organization_id(admin_file)
+            operator_email = read_admin_email(admin_file)
+            client.universal_auth_login(read_sync_credentials(admin_file))
+        except (SopsError, InfisicalError) as exc:
+            _fail(f"could not authenticate with {admin_file}: {exc}")
+            return
+        report = keyring_ops.audit(
+            client,
+            organization_id=organization_id,
+            operator_email=operator_email,
+            project=project,
+        )
+
+    for problem in report.errors:
+        click.secho(f"  error: {problem}", fg="red", err=True)
+    if not report.ok:
+        sys.exit(EXIT_RUNTIME)
+
+    click.echo(f"keyring project {report.project!r} ({report.project_id})")
+    entries = ", ".join(
+        f"{entry} ({report.key_types.get(entry, 'unknown')})" for entry in report.keys
+    )
+    click.echo(f"  entries: {entries or 'none'}")
+    for email, role in sorted(report.users.items()):
+        click.echo(f"  user      {email}  {role}")
+    for group, role in sorted(report.groups.items()):
+        click.echo(f"  group     {group}  {role}")
+    for identity, role in sorted(report.identities.items()):
+        click.echo(f"  identity  {identity}  {role}")
+
+    for warning in report.warnings:
+        click.secho(f"  warning: {warning}", fg="yellow", err=True)
+    click.secho(
+        f"{len(report.users)} user(s), {len(report.groups)} group(s), "
+        f"{len(report.identities)} identity(ies), {len(report.warnings)} warning(s)",
+        fg="yellow" if report.warnings else "green",
+    )
 
 
 # --------------------------------------------------------------------------
