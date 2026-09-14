@@ -196,6 +196,59 @@ rec {
     in
     lib.sort (a: b: identity a < identity b) (lib.attrValues byKey);
 
+  # The Go template that renders a whole Infisical folder as a dotenv file.
+  #
+  #   programs.nixfisical.agent.projects.work.templates."env" = {
+  #     content = nixfisical.lib.mkDotenvTemplate {
+  #       projectId = "abc-123";
+  #       environment = "dev";
+  #     };
+  #     destination = "${config.home.homeDirectory}/src/work/.env";
+  #   };
+  #
+  # The agent module's `dotenv.enable` calls this for you; it is exported
+  # because the whole point of the raw-`source` escape hatch is that a real
+  # template is a file you write, and the dotenv case should not be the one
+  # thing you cannot start from. Emit it, read it, then edit it into whatever
+  # your project actually needs.
+  #
+  # `text/template`, evaluated by the agent against the live instance -- so
+  # this string is a *program*, and nothing in it is a value. It is safe in
+  # the store.
+  #
+  # The `{{-` trimming is not cosmetic. Without it every directive leaves the
+  # newline that terminated it, and a dotenv file with a blank line between
+  # each pair is one that some parsers read as ending at the first one.
+  mkDotenvTemplate =
+    { projectId
+    , environment ? "dev"
+      # Infisical's own name for what this repo calls a folder. Kept as
+      # `secretPath` because that is the argument name in the template
+      # function, and this string is going to be read next to Infisical's
+      # docs rather than next to `mkInfisical`.
+    , secretPath ? "/"
+      # Pull sub-folders in too, flattened. Off, because two folders holding
+      # the same key name collapse into one line and which one wins is not
+      # something this template can tell you.
+    , recursive ? false
+      # Resolve `${OTHER_SECRET}` references before writing. On, matching the
+      # agent's own default -- a reference that reaches a .env file unresolved
+      # is read by the application as a literal.
+    , expandSecretReferences ? true
+    }:
+    let
+      modifier = builtins.toJSON {
+        inherit recursive expandSecretReferences;
+      };
+    in
+    ''
+      {{- with listSecrets "${projectId}" "${environment}" "${secretPath}" `${modifier}` }}
+      {{- range . }}
+      {{ .Key }}={{ .Value }}
+      {{- end }}
+      {{- end }}
+    '';
+
   # Fail the evaluation on manifest problems that would only surface as a
   # confusing HTTP 4xx halfway through a sync. Cheap to run at `nix flake
   # check` time; `nixfisical validate` repeats these against the rendered
