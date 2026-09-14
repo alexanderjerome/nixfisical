@@ -30,6 +30,14 @@ nixfisical = "nixfisical.cli:cli"
 # the agent runs on every host that injects directly and must not drag either
 # of them into that host's closure. See `minimal` in nix/pkgs/nixfisical.nix.
 nixfisical-agent = "nixfisical.agent:main"
+# The MCP server. Operator-side like `nixfisical` itself, and wrapped the same
+# way: `sync_diff` runs a real dry run, and a dry run decrypts every SOPS value
+# it would push, so this needs sops on PATH exactly as the CLI does. A separate
+# entry point rather than a `nixfisical mcp` subcommand because an MCP client's
+# stdio transport owns the whole process — the binary a `.mcp.json` names has
+# to be the server and nothing else, and a subcommand invites a wrapper script
+# whose stray output is a parse error at the client.
+nixfisical-mcp = "nixfisical.mcp:main"
 # The host-side half of `nixfisical keyring`, and only that half. A host that
 # could push to the keyring would be a host that could replace the key the
 # entire estate is encrypted to, so the upload stays in the operator CLI that

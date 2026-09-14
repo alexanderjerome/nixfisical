@@ -339,10 +339,16 @@
           inherit infisicalSource infisical-backend infisical-frontend;
         };
         bump-infisical = pkgs.callPackage ./nix/pkgs/bump-infisical.nix { };
+
+        # The offline half of the agent surface: every option this flake
+        # declares and every command its CLI has, generated from the module
+        # system and the click tree rather than written beside them. See
+        # nix/docs/default.nix for why this is a derivation and not a server.
+        docs = pkgs.callPackage ./nix/docs { inherit nixpkgs nixfisical; };
       in
       {
         packages = {
-          inherit nixfisical nixfisical-agent bump-infisical
+          inherit nixfisical nixfisical-agent bump-infisical docs
             infisical-backend infisical-frontend infisical-standalone;
           default = nixfisical;
         };
@@ -356,6 +362,18 @@
           type = "app";
           program = "${bump-infisical}/bin/bump-infisical";
           meta.description = "Bump the pinned Infisical release and its hashes";
+        };
+
+        # The online half of the agent surface. An app rather than only a
+        # binary in `packages` because this is what a consumer's `.mcp.json`
+        # names: `nix run github:jeirslab/nixfisical#mcp -- --url ...`, with no
+        # checkout and nothing installed. See pkgs/nixfisical/nixfisical/mcp.py
+        # for what it will and will not answer — it never returns a secret
+        # value, and it writes nothing without `--allow-writes`.
+        apps.mcp = {
+          type = "app";
+          program = "${nixfisical}/bin/nixfisical-mcp";
+          meta.description = "MCP server over a live Infisical instance (read-only by default)";
         };
 
         devShells.default = pkgs.mkShell {
@@ -375,6 +393,13 @@
 
         checks = {
           package = nixfisical;
+
+          # The docs derivation asserts its own emptiness cases, so building it
+          # is the check. Worth having in `checks` rather than leaving it to
+          # `packages`: it is the only thing that evaluates every module's
+          # options tree, including every `default` and `example`, which is a
+          # class of breakage nothing else here would notice.
+          inherit docs;
 
           # Build the sync app. There is nothing to assert about the result --
           # the point is that `writeShellApplication` runs shellcheck and that

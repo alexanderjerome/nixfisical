@@ -27,8 +27,15 @@
 # every host in the fleet, to be pulled over the wire on each deploy, for
 # nothing. The operator CLI is removed rather than left unwrapped: an
 # unwrapped `nixfisical` on a host would run, find no `sops` on PATH, and fail
-# somewhere inside a decrypt with an error about a missing binary. It keeps
-# `nixfisical-keyring-install`, which is the pull half of the keyring and needs
+# somewhere inside a decrypt with an error about a missing binary.
+#
+# `nixfisical-mcp` goes with it, for the reason above and one of its own: it is
+# a thing that answers questions about the whole estate, and the machine that
+# should be answering them is the operator's, not one of the hosts being asked
+# about. A host does not need to know what the other hosts' secrets are called.
+#
+# The minimal build keeps `nixfisical-keyring-install`, which is the pull half
+# of the keyring and needs
 # nothing on PATH: the key it receives is validated by the bech32 check in
 # keyring.py rather than by shelling out to age.
 { lib
@@ -79,10 +86,12 @@ python3Packages.buildPythonApplication rec {
   # are.
   postFixup =
     if minimal then ''
-      rm -f $out/bin/nixfisical
+      rm -f $out/bin/nixfisical $out/bin/nixfisical-mcp
     '' else ''
-      wrapProgram $out/bin/nixfisical \
-        --prefix PATH : ${lib.makeBinPath [ sops git age ]}
+      for bin in nixfisical nixfisical-mcp; do
+        wrapProgram $out/bin/$bin \
+          --prefix PATH : ${lib.makeBinPath [ sops git age ]}
+      done
     '';
 
   # The import check is still worth its keep alongside the tests: it catches
@@ -94,10 +103,12 @@ python3Packages.buildPythonApplication rec {
     "nixfisical.agent"
     "nixfisical.api"
     "nixfisical.bootstrap"
+    "nixfisical.docs"
     "nixfisical.generate"
     "nixfisical.keyring"
     "nixfisical.license"
     "nixfisical.material"
+    "nixfisical.mcp"
     "nixfisical.provision"
     "nixfisical.pull"
     "nixfisical.reconcile"

@@ -83,6 +83,7 @@ from nixfisical.access import (
     sync_access as run_sync_access,
 )
 from nixfisical.api import InfisicalClient, InfisicalError
+from nixfisical.docs import emit as docs_emit
 from nixfisical.bootstrap import (
     DEFAULT_ADD_ORG_COMMIT_MESSAGE,
     DEFAULT_ADOPT_COMMIT_MESSAGE,
@@ -2178,6 +2179,34 @@ def secrets_gen_command(
         + ("to write" if dry_run else "written"),
         fg="yellow" if dry_run else "green",
     )
+
+
+# --------------------------------------------------------------------------
+# docs
+# --------------------------------------------------------------------------
+
+
+@cli.command("docs")
+@click.option(
+    "--format",
+    "fmt",
+    type=click.Choice(["json", "markdown"]),
+    default="markdown",
+    show_default=True,
+    help="Emit the command tree as data or as a document.",
+)
+def docs_command(fmt: str) -> None:
+    """Print this CLI's whole command tree, generated from the tree itself.
+
+    For an agent operating nixfisical without a terminal to page `--help` in,
+    and for the `#docs` flake output, which renders this next to the module
+    options so both halves of the interface are described in one place.
+
+    Reads nothing: no instance, no SOPS file, no environment. The output
+    depends only on the version, so it is identical on every machine and safe
+    to publish.
+    """
+    click.echo(docs_emit(cli, fmt), nl=False)
 
 
 if __name__ == "__main__":  # pragma: no cover
