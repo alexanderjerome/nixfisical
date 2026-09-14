@@ -52,7 +52,16 @@ from typing import Any, Iterable
 
 from nixfisical.api import InfisicalClient, InfisicalError, UniversalAuthCredentials
 
-__all__ = ["AgentSpec", "AgentSummary", "SecretSpec", "materialise", "run", "main"]
+__all__ = [
+    "AgentError",
+    "AgentSpec",
+    "AgentSummary",
+    "SecretSpec",
+    "materialise",
+    "read_credential",
+    "run",
+    "main",
+]
 
 SPEC_VERSION = 1
 
@@ -177,13 +186,17 @@ class AgentSummary:
         )
 
 
-def _read_credential(path: Path, *, what: str) -> str:
+def read_credential(path: Path, *, what: str) -> str:
     """Read a credential file, stripping the trailing newline an editor adds.
 
     Whitespace is stripped rather than preserved because every way this file is
     produced -- ``sops -d``, a here-doc, a systemd credential -- can append a
     newline, and the resulting failure is an "Invalid credentials" that looks
     like a wrong secret rather than a stray byte.
+
+    Public because :mod:`nixfisical.keyring` reads the same pair of files from
+    the same places for the same reason, and a second copy of this would be a
+    second chance to forget the strip.
     """
     try:
         value = path.read_text().strip()
@@ -541,8 +554,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         spec = AgentSpec.load(args.spec)
         credentials = UniversalAuthCredentials(
-            client_id=_read_credential(args.client_id_file, what="client id"),
-            client_secret=_read_credential(args.client_secret_file, what="client secret"),
+            client_id=read_credential(args.client_id_file, what="client id"),
+            client_secret=read_credential(args.client_secret_file, what="client secret"),
         )
     except AgentError as exc:
         print(f"nixfisical-agent: {exc}", file=sys.stderr)

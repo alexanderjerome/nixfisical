@@ -245,7 +245,7 @@ updated, and **deleted**. Run it first.
 | `nixosModules.default` | Both of the above. |
 | `nixosModules.inject` | Fetches this host's secrets from Infisical at boot. Experimental; **not** in `default`. |
 | `packages.nixfisical` | The `nixfisical` CLI. |
-| `packages.nixfisical-agent` | The host half of `nixosModules.inject`, without the CLI or its closure. |
+| `packages.nixfisical-agent` | The host halves — `nixfisical-agent` and `nixfisical-keyring-install` — without the CLI or its closure. |
 | `packages.infisical-backend` | The Infisical API, built from source. No web UI. |
 | `packages.infisical-frontend` | The Infisical web UI, as static files. |
 | `packages.infisical-standalone` | Both, with the API serving the UI. |
@@ -428,6 +428,7 @@ nixfisical provision-host mint a host's own scoped identity into its SOPS file
 nixfisical validate      check a manifest offline (exit 2 on problems)
 nixfisical status        is it reachable, and does the sync identity still work
 nixfisical secrets       read, write and mint the SOPS values the rest reads
+nixfisical keyring       store the estate's age key, and audit who can read it
 ```
 
 Bootstrap is the destructive one, so it is guarded properly. If the admin file
@@ -850,8 +851,110 @@ could otherwise produce silently.
 
 `packages.nixfisical-agent` is the host half: the same source as `nixfisical`
 without the operator CLI, and without the `sops` and `git` closure that wrapping
-it would drag onto every host (219 MiB against 445 MiB). The module picks it by
-default.
+it would drag onto every host (219 MiB against 468 MiB). The module picks it by
+default. It also carries `nixfisical-keyring-install` — see
+[The keyring](#the-keyring), which is the same split for the same reason.
+
+## The keyring
+
+Every other command in this tool projects *out* of SOPS: SOPS holds the value,
+Infisical gets a copy, the host gets a copy. `nixfisical keyring` is the one
+place that runs the other way, and it runs the other way because it has to. The
+thing it moves is the estate's **age key** — the key SOPS files are encrypted
+to — and an age key cannot arrive in a SOPS file, because it is what opens SOPS
+files.
+
+So the instance holds it, exactly one project holds it, and that project's
+access list is the whole security boundary.
+
+```sh
+# Operator, once per estate. Reads ~/.ssh/sops-age.key unless told otherwise
+# (or $SOPS_AGE_KEY_FILE), creates the `keyring` project if it is missing, and
+# stores the key alongside where it should land on a host.
+nixfisical --url https://infisical.example.com keyring push jeirslab \
+  --install-path /var/lib/sops-nix/key.txt \
+  --install-owner root --install-group root --install-mode 0400
+
+# Any time. Who can read it, and is that still only you?
+nixfisical --url https://infisical.example.com keyring audit
+```
+
+`push` is **create-only**. If `AGE_SECRET_KEY` is already there it refuses and
+names the recipients currently stored, so you can see which key you were about
+to strand before you pass `--replace`. The key is parsed and bech32-checked
+before anything is created, and the recipients in the summary are derived by
+`age-keygen -y` on stdin — the file's own `# public key:` comments are only the
+fallback, and the summary says which one it used.
+
+Six values go in, under `/<name>` in the `prod` environment:
+`AGE_SECRET_KEY`, `AGE_PUBLIC_KEY`, and `AGE_KEY_PATH` / `AGE_KEY_OWNER` /
+`AGE_KEY_GROUP` / `AGE_KEY_MODE`. Placement travels with the key on purpose: a
+host that knows where to put it needs no per-host configuration beyond its
+name, and moving the estate's key file becomes one `push --replace` rather than
+a deploy.
+
+### The keyring project must not appear in the manifest
+
+`sync-access` grants every group a manifest names access to every project that
+manifest names. There is no per-project opt-out. Add the keyring to a manifest
+and the estate's master key is handed to everyone in that group, silently and
+successfully.
+
+`keyring audit` is what notices. It warns on any group at all (naming the
+manifest as the usual cause), on any human who is not the superadmin, and on
+the superadmin being absent. Host identities are not flagged — they are the
+point. It exits 0 with warnings, so it is a thing to read, not a gate.
+
+Infisical project roles do not scope to folders without a licensed custom role,
+so **one keyring project is one blast radius**: an identity that can read one
+key in it can read every key in it. Multiple estates want multiple projects,
+not multiple folders.
+
+### Pulling it onto a host
+
+```sh
+nixfisical-keyring-install --name jeirslab \
+  --url https://infisical.example.com \
+  --organization-id "$ORG" \
+  --client-id-file /run/secrets/infisical/client_id \
+  --client-secret-file /run/secrets/infisical/client_secret
+```
+
+A separate binary, not a `nixfisical` subcommand, and that is a security
+property rather than packaging convenience: a host that could *push* to the
+keyring could replace the key the entire estate is encrypted to. The minimal
+build (`packages.nixfisical-agent`) deletes the operator CLI and keeps this,
+which it can do because the pull half shells out to nothing — the key it
+receives is validated by a pure-Python bech32 check, not by an `age` on PATH.
+
+**The circularity, and how to cut it.** The host needs a credential to reach
+Infisical; that credential normally arrives by sops-nix; sops-nix needs the age
+key this command is fetching. The way out is to not use the estate key for that
+first step:
+
+```nix
+sops.age.sshKeyPaths = [ "/etc/ssh/ssh_host_ed25519_key" ];
+```
+
+That derives a per-host age identity from a key the host generated itself, with
+no help from anyone. Encrypt one small per-host file to it holding nothing but
+the universal-auth credential from `provision-host --project keyring`, and the
+host can then pull the *central* key and decrypt everything else normally. The
+estate key is never a bootstrap input.
+
+**What the host is trusting.** The install path comes from the instance, which
+means a compromised instance can tell a root process where to write. The
+mitigations are real but worth stating rather than assuming: the path must be
+absolute, contain no `..` and no NUL; the mode must not be group- or
+world-readable; and the command **refuses to overwrite any existing file that
+is not itself an age key file**. That last one is what turns the `/etc/shadow`
+case into a loud refusal instead of an outage. `--path` overrides the stored
+location locally, and the summary says when it did.
+
+There is deliberately no `--expect-recipient`. Checking the fetched
+`AGE_PUBLIC_KEY` against the fetched `AGE_SECRET_KEY` proves nothing when an
+attacker who can change one can change the other; it would read like a
+guarantee and be theatre.
 
 ## What it does not do yet
 
@@ -862,6 +965,13 @@ generated spec round-trips through the real agent binary — but nothing has run
 it against a live instance on a real host, and there is no VM test. Treat the
 first host as an experiment, and keep its secrets in SOPS until it has survived
 a reboot.
+
+**The keyring has not run against a live instance either.** Its Python is
+covered offline — key parsing, placement validation, the create-only refusal,
+the audit warnings, and every refusal path in the installer — but no real
+`keyring push` has happened, and no host has pulled a key with it. The
+`sops.age.sshKeyPaths` bootstrap above is the documented cut, not a tested one.
+Do the first one by hand with a throwaway key and a host you can rebuild.
 
 ## Roadmap
 
@@ -874,6 +984,11 @@ a reboot.
 - A NixOS VM test for the injection agent: boot with a reachable instance, boot
   with an unreachable one and no cache (must fail closed), and boot with an
   unreachable one and a cache (must come up degraded and say so).
+- A NixOS module for `nixfisical-keyring-install`, so the pull is a
+  `sops.age.keyFile` prerequisite unit rather than something an operator runs
+  once by hand and hopes was remembered when the host is rebuilt.
+- Revoking keyring access. `keyring audit` reports a group that should not be
+  there; removing it is still a trip to the UI.
 
 ## Prior art
 

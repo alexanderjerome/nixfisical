@@ -6,6 +6,13 @@
 # `git` is only needed for `bootstrap --git-commit`, but wrapping both keeps
 # the tool usable from a bare `nix run` with nothing else installed.
 #
+# `age` is wrapped for one command. `keyring push` shells out to `age-keygen -y`
+# to derive the recipients of the key it is uploading, so the operator sees what
+# they just stored and `keyring audit` can name it later without decrypting
+# anything. It is not required — the key file's own `# public key:` comments are
+# the fallback and the summary says which source it used — but age is a small
+# closure and a derived recipient beats an asserted one.
+#
 # `psql` is deliberately NOT wrapped. Only `sync-access --create-missing-groups`
 # shells out to it, that flag is off by default and most fleets never set it,
 # and postgresql is a large closure to hang on every user of this tool for a
@@ -20,11 +27,15 @@
 # every host in the fleet, to be pulled over the wire on each deploy, for
 # nothing. The operator CLI is removed rather than left unwrapped: an
 # unwrapped `nixfisical` on a host would run, find no `sops` on PATH, and fail
-# somewhere inside a decrypt with an error about a missing binary.
+# somewhere inside a decrypt with an error about a missing binary. It keeps
+# `nixfisical-keyring-install`, which is the pull half of the keyring and needs
+# nothing on PATH: the key it receives is validated by the bech32 check in
+# keyring.py rather than by shelling out to age.
 { lib
 , python3Packages
 , sops
 , git
+, age
 , makeWrapper
 , minimal ? false
 }:
@@ -71,7 +82,7 @@ python3Packages.buildPythonApplication rec {
       rm -f $out/bin/nixfisical
     '' else ''
       wrapProgram $out/bin/nixfisical \
-        --prefix PATH : ${lib.makeBinPath [ sops git ]}
+        --prefix PATH : ${lib.makeBinPath [ sops git age ]}
     '';
 
   # The import check is still worth its keep alongside the tests: it catches
@@ -84,6 +95,7 @@ python3Packages.buildPythonApplication rec {
     "nixfisical.api"
     "nixfisical.bootstrap"
     "nixfisical.generate"
+    "nixfisical.keyring"
     "nixfisical.license"
     "nixfisical.provision"
     "nixfisical.pull"

@@ -30,6 +30,11 @@ nixfisical = "nixfisical.cli:cli"
 # the agent runs on every host that injects directly and must not drag either
 # of them into that host's closure. See `minimal` in nix/pkgs/nixfisical.nix.
 nixfisical-agent = "nixfisical.agent:main"
+# The host-side half of `nixfisical keyring`, and only that half. A host that
+# could push to the keyring would be a host that could replace the key the
+# entire estate is encrypted to, so the upload stays in the operator CLI that
+# `minimal` deletes and this one only pulls and installs.
+nixfisical-keyring-install = "nixfisical.keyring:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
