@@ -30,13 +30,17 @@ import pytest
 
 from nixfisical.api import InfisicalError
 from nixfisical.keyring import (
+    AGE,
     ENVIRONMENT,
     KEY_GROUP,
     KEY_MODE,
     KEY_OWNER,
     KEY_PATH,
     KEY_PUBLIC,
+    KEY_PUBLIC_PATH,
     KEY_SECRET,
+    KEY_TYPE,
+    SSH,
     KeyringError,
     Placement,
     audit,
@@ -44,6 +48,12 @@ from nixfisical.keyring import (
     parse_age_key_file,
     push,
 )
+
+# The SSH vectors live next door, where the parser that reads them is tested.
+# Copying them here would give two files that can drift into disagreeing about
+# what a valid key looks like.
+from test_material import SSH_ED25519, SSH_ED25519_PUB
+from test_material import SSH_ED25519_COMMENT as SSH_COMMENT
 
 SECRET_A = "AGE-SECRET-KEY-1NXC4U76NRFG5S3C44J9K3ZATCRET0039Y753NN30UU58ZTY89C6S40CR7W"
 PUBLIC_A = "age1sy4gt0mt0dasaygrfhhkarx7q2wpe5uysd09stqv7qh5hnpzlcnq9z9wz5"
@@ -409,7 +419,7 @@ def test_install_places_the_key_where_the_instance_says(tmp_path: Path) -> None:
     assert summary.written
     assert destination.read_text() == KEY_FILE_A
     assert oct(destination.stat().st_mode & 0o777) == "0o400"
-    assert summary.recipients == [PUBLIC_A]
+    assert summary.public == [PUBLIC_A]
 
 
 def test_install_is_a_no_op_when_the_key_has_not_changed(tmp_path: Path) -> None:
@@ -551,3 +561,258 @@ def test_install_ignores_other_entries_in_the_same_project(tmp_path: Path) -> No
 def test_environment_is_the_only_one() -> None:
     """Key material has no dev/staging; a second environment is a mistake."""
     assert ENVIRONMENT == "prod"
+
+
+# -- ssh entries -------------------------------------------------------------
+#
+# The type layer is tested on its own in test_material.py. What is tested here
+# is the part that layer cannot see: that an entry carries its type across the
+# instance, that the placement it lands with is the type's and not age's, and
+# that the public half is written beside the private one.
+
+
+def ssh_placement_at(destination: Path) -> list[dict[str, Any]]:
+    return [
+        stored("/laptop", KEY_TYPE, "ssh"),
+        stored("/laptop", KEY_PATH, str(destination)),
+        stored("/laptop", KEY_PUBLIC_PATH, f"{destination}.pub"),
+        stored("/laptop", KEY_MODE, "0600"),
+        stored("/laptop", KEY_OWNER, _USER),
+        stored("/laptop", KEY_GROUP, _GROUP),
+    ]
+
+
+def test_push_sniffs_an_ssh_key_and_stores_its_type() -> None:
+    client = FakeClient()
+    summary = push(
+        client,
+        name="laptop",
+        key_text=SSH_ED25519,
+        organization_id="org",
+        operator_email=None,
+    )
+    assert summary.ok, summary.errors
+    assert summary.key_type == "ssh"
+    assert client.written[KEY_TYPE] == "ssh"
+    assert client.written[KEY_SECRET] == SSH_ED25519
+    assert client.written[KEY_PUBLIC] == SSH_ED25519_PUB
+
+
+def test_an_ssh_entry_does_not_inherit_the_age_placement() -> None:
+    """The bug this exists to prevent: an SSH key stored at the sops-nix path.
+
+    Nothing would fail at push time, nothing would fail at install time, and
+    sops-nix on that host would then find an SSH key where its age key belongs.
+    """
+    client = FakeClient()
+    push(
+        client,
+        name="laptop",
+        key_text=SSH_ED25519,
+        organization_id="org",
+        operator_email=None,
+    )
+    assert client.written[KEY_PATH] == SSH.default_path
+    assert client.written[KEY_MODE] == "0600"
+    assert client.written[KEY_PUBLIC_PATH] == SSH.default_path + ".pub"
+
+
+def test_an_age_entry_stores_no_public_path() -> None:
+    """No file is written for it, so a path for one would be a value with no
+    meaning that a later reader would try to honour."""
+    client = FakeClient()
+    push(
+        client,
+        name="fleet",
+        key_text=KEY_FILE_A,
+        organization_id="org",
+        operator_email=None,
+    )
+    assert KEY_PUBLIC_PATH not in client.written
+
+
+def test_push_prefers_the_sidecar_pub_because_it_carries_the_comment() -> None:
+    client = FakeClient()
+    summary = push(
+        client,
+        name="laptop",
+        key_text=SSH_ED25519,
+        organization_id="org",
+        operator_email=None,
+        public_override=f"{SSH_ED25519_PUB} {SSH_COMMENT}\n",
+    )
+    assert summary.ok, summary.errors
+    assert client.written[KEY_PUBLIC] == f"{SSH_ED25519_PUB} {SSH_COMMENT}"
+
+
+def test_push_refuses_an_ssh_key_declared_as_age() -> None:
+    """`--type` forcing the wrong answer must fail loudly, not store it."""
+    summary = push(
+        FakeClient(),
+        name="laptop",
+        key_text=SSH_ED25519,
+        organization_id="org",
+        operator_email=None,
+        material=AGE,
+    )
+    assert not summary.ok
+    assert "age key file" in " ".join(summary.errors)
+
+
+def test_install_places_an_ssh_key_and_its_public_half(tmp_path: Path) -> None:
+    destination = tmp_path / "id_ed25519"
+    client = FakeClient(
+        projects={"keyring": "k1"},
+        secrets=[
+            stored("/laptop", KEY_SECRET, SSH_ED25519),
+            stored("/laptop", KEY_PUBLIC, f"{SSH_ED25519_PUB} {SSH_COMMENT}"),
+            *ssh_placement_at(destination),
+        ],
+    )
+    summary = install(client, name="laptop", organization_id="org")
+    assert summary.ok, summary.errors
+    assert summary.key_type == "ssh"
+    assert destination.read_text() == SSH_ED25519
+    assert oct(destination.stat().st_mode & 0o777) == "0o600"
+
+    public = Path(f"{destination}.pub")
+    assert public.read_text() == f"{SSH_ED25519_PUB} {SSH_COMMENT}\n"
+    # World-readable on purpose, and from the type table rather than the
+    # instance -- see Placement.validated_mode.
+    assert oct(public.stat().st_mode & 0o777) == "0o644"
+    assert summary.public_written
+
+
+def test_install_will_not_clobber_a_foreign_file_at_the_public_path(
+    tmp_path: Path,
+) -> None:
+    """The public path is instance-controlled too, and 0644 is not harmless.
+
+    Aiming it at a config file the host reads would be a working attack on a
+    host that never touches the private key at all.
+    """
+    destination = tmp_path / "id_ed25519"
+    public = tmp_path / "id_ed25519.pub"
+    public.write_text("root:x:0:0:root:/root:/bin/bash\n")
+    client = FakeClient(
+        projects={"keyring": "k1"},
+        secrets=[
+            stored("/laptop", KEY_SECRET, SSH_ED25519),
+            stored("/laptop", KEY_PUBLIC, SSH_ED25519_PUB),
+            *ssh_placement_at(destination),
+        ],
+    )
+    summary = install(client, name="laptop", organization_id="org")
+    assert not summary.ok
+    assert KEY_PUBLIC_PATH in " ".join(summary.errors)
+    assert public.read_text() == "root:x:0:0:root:/root:/bin/bash\n"
+    assert not destination.exists()
+
+
+def test_install_refuses_an_age_key_where_an_ssh_key_is_declared(
+    tmp_path: Path,
+) -> None:
+    """The instance says ssh and stores something else -- a mixed-up push, or a
+    tampered entry. Either way the host must not write it."""
+    destination = tmp_path / "id_ed25519"
+    client = FakeClient(
+        projects={"keyring": "k1"},
+        secrets=[
+            stored("/laptop", KEY_SECRET, KEY_FILE_A),
+            *ssh_placement_at(destination),
+        ],
+    )
+    summary = install(client, name="laptop", organization_id="org")
+    assert not summary.ok
+    assert not destination.exists()
+
+
+def test_install_will_not_overwrite_an_ssh_key_with_an_age_key(tmp_path: Path) -> None:
+    """The clobber guard is per type, not merely "is this a key of some kind"."""
+    destination = tmp_path / "key.txt"
+    destination.write_text(SSH_ED25519)
+    client = FakeClient(
+        projects={"keyring": "k1"},
+        secrets=[
+            stored("/fleet", KEY_SECRET, KEY_FILE_A),
+            *placement_at(destination),
+        ],
+    )
+    summary = install(client, name="fleet", organization_id="org")
+    assert not summary.ok
+    assert destination.read_text() == SSH_ED25519
+
+
+def test_install_says_so_when_an_ssh_entry_has_no_public_half(tmp_path: Path) -> None:
+    """A private key with no `.pub` beside it breaks `ssh -i`, so this is worth
+    a line rather than silence -- but it is not worth refusing the private key
+    the host came for."""
+    destination = tmp_path / "id_ed25519"
+    client = FakeClient(
+        projects={"keyring": "k1"},
+        secrets=[
+            stored("/laptop", KEY_SECRET, SSH_ED25519),
+            *ssh_placement_at(destination),
+        ],
+    )
+    summary = install(client, name="laptop", organization_id="org")
+    assert summary.ok, summary.errors
+    assert destination.exists()
+    assert not Path(f"{destination}.pub").exists()
+    assert "--public-from-file" in " ".join(summary.actions)
+
+
+def test_an_entry_without_a_type_is_read_as_age(tmp_path: Path) -> None:
+    """Entries pushed before KEY_TYPE existed must still install."""
+    destination = tmp_path / "key.txt"
+    client = FakeClient(
+        projects={"keyring": "k1"},
+        secrets=[
+            stored("/fleet", KEY_SECRET, KEY_FILE_A),
+            *placement_at(destination),
+        ],
+    )
+    summary = install(client, name="fleet", organization_id="org")
+    assert summary.ok, summary.errors
+    assert summary.key_type == "age"
+
+
+def test_path_override_moves_the_public_half_with_it(tmp_path: Path) -> None:
+    """Otherwise --path splits a key pair across two directories, which fails
+    later and somewhere else."""
+    declared = tmp_path / "declared"
+    actual = tmp_path / "actual" / "id_ed25519"
+    actual.parent.mkdir()
+    client = FakeClient(
+        projects={"keyring": "k1"},
+        secrets=[
+            stored("/laptop", KEY_SECRET, SSH_ED25519),
+            stored("/laptop", KEY_PUBLIC, SSH_ED25519_PUB),
+            *ssh_placement_at(declared),
+        ],
+    )
+    summary = install(
+        client, name="laptop", organization_id="org", path_override=str(actual)
+    )
+    assert summary.ok, summary.errors
+    assert summary.public_path == f"{actual}.pub"
+    assert Path(f"{actual}.pub").exists()
+    assert not Path(f"{declared}.pub").exists()
+
+
+def test_audit_names_the_type_of_each_entry() -> None:
+    client = FakeClient(
+        projects={"keyring": "k1"},
+        users={"admin@example.com": "admin"},
+        secrets=[
+            stored("/fleet", KEY_SECRET, KEY_FILE_A),
+            stored("/fleet", KEY_TYPE, "age"),
+            stored("/laptop", KEY_SECRET, SSH_ED25519),
+            stored("/laptop", KEY_TYPE, "ssh"),
+        ],
+    )
+    report = audit(
+        client, organization_id="org", operator_email="admin@example.com"
+    )
+    assert report.keys == ["fleet", "laptop"]
+    assert report.key_types == {"fleet": "age", "laptop": "ssh"}

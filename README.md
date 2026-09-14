@@ -860,9 +860,9 @@ default. It also carries `nixfisical-keyring-install` — see
 Every other command in this tool projects *out* of SOPS: SOPS holds the value,
 Infisical gets a copy, the host gets a copy. `nixfisical keyring` is the one
 place that runs the other way, and it runs the other way because it has to. The
-thing it moves is the estate's **age key** — the key SOPS files are encrypted
-to — and an age key cannot arrive in a SOPS file, because it is what opens SOPS
-files.
+thing it started as was the estate's **age key** — the key SOPS files are
+encrypted to — and an age key cannot arrive in a SOPS file, because it is what
+opens SOPS files.
 
 So the instance holds it, exactly one project holds it, and that project's
 access list is the whole security boundary.
@@ -875,23 +875,67 @@ nixfisical --url https://infisical.example.com keyring push jeirslab \
   --install-path /var/lib/sops-nix/key.txt \
   --install-owner root --install-group root --install-mode 0400
 
-# Any time. Who can read it, and is that still only you?
+# An SSH key. The type is sniffed; --type says it out loud when you want the
+# error to be specific. The sidecar .pub is worth passing: the comment is what
+# makes the key identifiable in an authorized_keys a year from now.
+nixfisical --url https://infisical.example.com keyring push laptop-deploy \
+  --from-file ~/.ssh/id_ed25519 --public-from-file ~/.ssh/id_ed25519.pub \
+  --install-path /home/alex/.ssh/id_ed25519 \
+  --install-owner alex --install-group users
+
+# Any time. Who can read them, and is that still only you?
 nixfisical --url https://infisical.example.com keyring audit
 ```
 
-`push` is **create-only**. If `AGE_SECRET_KEY` is already there it refuses and
-names the recipients currently stored, so you can see which key you were about
-to strand before you pass `--replace`. The key is parsed and bech32-checked
-before anything is created, and the recipients in the summary are derived by
-`age-keygen -y` on stdin — the file's own `# public key:` comments are only the
-fallback, and the summary says which one it used.
+`push` is **create-only**. If `PRIVATE_KEY` is already there it refuses and
+names the public half currently stored, so you can see which key you were about
+to strand before you pass `--replace`. Validation happens before anything is
+created — an age key against its bech32 checksum, an SSH key by parsing its
+`openssh-key-v1` container — so a truncated paste fails before a project exists.
 
-Six values go in, under `/<name>` in the `prod` environment:
-`AGE_SECRET_KEY`, `AGE_PUBLIC_KEY`, and `AGE_KEY_PATH` / `AGE_KEY_OWNER` /
-`AGE_KEY_GROUP` / `AGE_KEY_MODE`. Placement travels with the key on purpose: a
-host that knows where to put it needs no per-host configuration beyond its
-name, and moving the estate's key file becomes one `push --replace` rather than
-a deploy.
+Up to eight values go in, under `/<name>` in the `prod` environment:
+
+| value             | what it is                                           |
+| ----------------- | ---------------------------------------------------- |
+| `KEY_TYPE`        | `age` or `ssh`                                       |
+| `PRIVATE_KEY`     | the key file, verbatim                               |
+| `PUBLIC_KEY`      | age recipients, or the SSH public line               |
+| `KEY_PATH`        | where the private half goes on a host                |
+| `KEY_OWNER`       | who owns it there                                    |
+| `KEY_GROUP`       |                                                      |
+| `KEY_MODE`        | refused unless owner-only, whatever the type         |
+| `PUBLIC_KEY_PATH` | where the `.pub` goes — SSH only                     |
+
+Placement travels with the key on purpose: a host that knows where to put it
+needs no per-host configuration beyond its name, and moving a key file becomes
+one `push --replace` rather than a deploy.
+
+### Why SSH keys are here and not in a certificate feature
+
+Infisical had an SSH certificate authority. It was **removed from the product**
+— migration `20260729150000_drop-ssh-and-ai-mcp-tables` drops every `ssh_*`
+table, and that migration predates the version this repo pins. Marketing pages
+and older docs still describe it; they are stale. What replaced it, PAM and the
+SSH dynamic-secret provider, lives under `ee/` behind the same licence gate that
+already blocks groups.
+
+So on a self-hosted instance an SSH key is not a certificate operation. It is a
+secret with a placement policy — which is exactly what a keyring entry already
+was, so `--type ssh` is the whole feature rather than a second subsystem.
+
+What a type changes is narrow, and lives in `nixfisical/material.py`: how the
+material is validated, how its public half is derived, and what it defaults to
+on disk. Push, audit and install do not branch on it.
+
+Both validators are **pure Python**, which is a requirement rather than a
+preference: the host runs the minimal build, which carries no `age` and no
+`ssh-keygen`, and the host is exactly where a mangled key must be caught — it is
+about to be written over the one that works. It pays off twice for SSH, because
+the public half of an OpenSSH private key sits in cleartext *inside* the private
+file, ahead of the encrypted section. A passphrase-protected key can therefore
+have its `.pub` derived without the passphrase and without shelling out. `age`
+has no equivalent, which is why `age-keygen -y` is authoritative there and the
+`# public key:` comment is only a fallback the summary tells you it used.
 
 ### The keyring project must not appear in the manifest
 
@@ -924,8 +968,12 @@ A separate binary, not a `nixfisical` subcommand, and that is a security
 property rather than packaging convenience: a host that could *push* to the
 keyring could replace the key the entire estate is encrypted to. The minimal
 build (`packages.nixfisical-agent`) deletes the operator CLI and keeps this,
-which it can do because the pull half shells out to nothing — the key it
-receives is validated by a pure-Python bech32 check, not by an `age` on PATH.
+which it can do because the pull half shells out to nothing.
+
+What lands is decided by the entry: `KEY_TYPE` picks the validator, `KEY_PATH`
+and `KEY_MODE` the private half, and for an SSH entry the public half is written
+beside it at `PUBLIC_KEY_PATH`. `--path` moves both, together — splitting a key
+pair across two directories fails later and somewhere else.
 
 **The circularity, and how to cut it.** The host needs a credential to reach
 Infisical; that credential normally arrives by sops-nix; sops-nix needs the age
@@ -946,15 +994,21 @@ estate key is never a bootstrap input.
 means a compromised instance can tell a root process where to write. The
 mitigations are real but worth stating rather than assuming: the path must be
 absolute, contain no `..` and no NUL; the mode must not be group- or
-world-readable; and the command **refuses to overwrite any existing file that
-is not itself an age key file**. That last one is what turns the `/etc/shadow`
-case into a loud refusal instead of an outage. `--path` overrides the stored
-location locally, and the summary says when it did.
+world-readable, for any type; and the command **refuses to overwrite any
+existing file that is not itself a key of the declared type**. That last one is
+what turns the `/etc/shadow` case into a loud refusal instead of an outage. It
+applies to the `.pub` too — a world-readable file at an instance-chosen path is
+a working attack on a host that never touches the private key at all. `--path`
+overrides the stored location locally, and the summary says when it did.
+
+The one thing the instance does **not** choose is the mode of the public half.
+That comes from the type table, so no value the keyring holds can talk a host
+into writing a world-readable private key.
 
 There is deliberately no `--expect-recipient`. Checking the fetched
-`AGE_PUBLIC_KEY` against the fetched `AGE_SECRET_KEY` proves nothing when an
-attacker who can change one can change the other; it would read like a
-guarantee and be theatre.
+`PUBLIC_KEY` against the fetched `PRIVATE_KEY` proves nothing when an attacker
+who can change one can change the other; it would read like a guarantee and be
+theatre.
 
 ## What it does not do yet
 
@@ -967,9 +1021,13 @@ first host as an experiment, and keep its secrets in SOPS until it has survived
 a reboot.
 
 **The keyring has not run against a live instance either.** Its Python is
-covered offline — key parsing, placement validation, the create-only refusal,
-the audit warnings, and every refusal path in the installer — but no real
-`keyring push` has happened, and no host has pulled a key with it. The
+covered offline — key parsing for both types, placement validation, the
+create-only refusal, the audit warnings, and every refusal path in the installer
+— but no real `keyring push` has happened, and no host has pulled a key with it.
+The SSH public-key derivation is checked byte-for-byte against recorded
+`ssh-keygen` output for plain ed25519, passphrase-protected ed25519 and RSA;
+PEM-format keys (`ssh-keygen -m PEM`) are storable but cannot derive a public
+half, so they need `--public-from-file`. The
 `sops.age.sshKeyPaths` bootstrap above is the documented cut, not a tested one.
 Do the first one by hand with a throwaway key and a host you can rebuild.
 

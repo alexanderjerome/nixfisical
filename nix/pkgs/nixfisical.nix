@@ -97,6 +97,7 @@ python3Packages.buildPythonApplication rec {
     "nixfisical.generate"
     "nixfisical.keyring"
     "nixfisical.license"
+    "nixfisical.material"
     "nixfisical.provision"
     "nixfisical.pull"
     "nixfisical.reconcile"

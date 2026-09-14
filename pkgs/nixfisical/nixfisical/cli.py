@@ -9,7 +9,7 @@ Commands map onto the jobs described in the package docstring:
     nixfisical import      pull Infisical-owned secrets down into SOPS
     nixfisical sync-access grant manifest groups project access
     nixfisical provision-host  mint a host's own identity for direct injection
-    nixfisical keyring     store the estate's age key, and audit who reads it
+    nixfisical keyring     store age and SSH keys, and audit who reads them
     nixfisical validate    check a manifest, offline
     nixfisical status      is the instance up, and can we still log in?
     nixfisical license     which licence-gated features does it permit?
@@ -1051,12 +1051,17 @@ def provision_host_command(
 
 @cli.group("keyring")
 def keyring_group() -> None:
-    """Store the estate's age key in Infisical, and audit who can read it.
+    """Store key material in Infisical, and audit who can read it.
 
     The one place this tool moves key material *into* the instance rather than
     a value the instance is a view of. An age key cannot come from a SOPS file,
     because it is the thing that opens SOPS files, so getting one onto a fresh
     host is a job nothing else here does.
+
+    SSH keys live here too, for a different reason: Infisical's SSH certificate
+    authority was removed from the product, and what replaced it is behind a
+    licence. So an SSH key on a self-hosted instance is a secret with a
+    placement policy -- which is what a keyring entry already was.
 
     It does not remove the bootstrap problem, it shrinks it. A host still needs
     a credential before it can pull anything; what changes is that the
@@ -1080,8 +1085,28 @@ def keyring_group() -> None:
     "key_file",
     default=None,
     type=click.Path(path_type=Path),
-    help="Age key file to upload, verbatim. Defaults to the same key this tool "
+    help="Key file to upload, verbatim. Defaults to the same age key this tool "
     "decrypts with: SOPS_AGE_KEY_FILE, then ~/.ssh/sops-age.key.",
+)
+@click.option(
+    "--type",
+    "key_type",
+    type=click.Choice(["auto", *sorted(keyring_ops.TYPES)]),
+    default="auto",
+    show_default=True,
+    help="What kind of key this is. 'auto' sniffs the file, which is reliable "
+    "-- bech32 lines and PEM armour are not confusable. Naming it explicitly "
+    "buys a specific error instead of 'cannot tell what this is'.",
+)
+@click.option(
+    "--public-from-file",
+    "public_file",
+    default=None,
+    type=click.Path(path_type=Path),
+    help="Store this as the public half instead of deriving it. Use the sidecar "
+    "'.pub': it carries the comment, which is what makes an authorized_keys "
+    "entry identifiable later. Required for a PEM-format key, whose public half "
+    "cannot be computed without RSA/EC arithmetic.",
 )
 @click.option(
     "--project",
@@ -1092,10 +1117,17 @@ def keyring_group() -> None:
 )
 @click.option(
     "--install-path",
-    default=keyring_ops.DEFAULT_INSTALL_PATH,
-    show_default=True,
+    default=None,
     help="Where a host installs this key. Stored in the instance so it lives in "
-    "one place rather than in every host's configuration.",
+    "one place rather than in every host's configuration. Defaults to the type's "
+    f"own: {keyring_ops.AGE.default_path} for age, "
+    f"{keyring_ops.SSH.default_path} for ssh.",
+)
+@click.option(
+    "--install-public-path",
+    default=None,
+    help="Where the public half goes, for the types that install one. Defaults "
+    "to the install path plus '.pub'.",
 )
 @click.option(
     "--install-owner",
@@ -1111,10 +1143,11 @@ def keyring_group() -> None:
 )
 @click.option(
     "--install-mode",
-    default=keyring_ops.DEFAULT_MODE,
-    show_default=True,
-    help="Mode of the installed key file. Anything readable beyond the owner "
-    "is refused.",
+    default=None,
+    help="Mode of the installed private key. Anything readable beyond the owner "
+    "is refused, whatever the type. Defaults to the type's own: "
+    f"{keyring_ops.AGE.default_mode} for age, {keyring_ops.SSH.default_mode} for "
+    "ssh. The public half's mode is not settable -- it comes from the type.",
 )
 @click.option(
     "--replace",
@@ -1142,22 +1175,29 @@ def keyring_push_command(
     ctx: click.Context,
     name: str,
     key_file: Path | None,
+    key_type: str,
+    public_file: Path | None,
     project: str,
-    install_path: str,
+    install_path: str | None,
+    install_public_path: str | None,
     install_owner: str,
     install_group: str,
-    install_mode: str,
+    install_mode: str | None,
     replace: bool,
     no_operator: bool,
     dry_run: bool,
 ) -> None:
-    """Upload an age key and its placement policy as keyring entry NAME.
+    """Upload a key and its placement policy as keyring entry NAME.
 
     The file is stored verbatim, comments and all, because an age key file may
     hold several keys -- which is how a rekeying happens without a flag day --
-    and re-serialising it would quietly drop the ones after the first. Every
-    key in it is checked against its own bech32 checksum first: a truncated
-    paste produces a key that looks right and decrypts nothing.
+    and re-serialising it would quietly drop the ones after the first. The same
+    applies to an OpenSSH key, whose armour is load-bearing.
+
+    It is validated first, in pure Python, so the same check runs on the host at
+    install time: an age key against its bech32 checksum, an SSH key by parsing
+    its ``openssh-key-v1`` container. A truncated paste produces a key that looks
+    right and works for nothing.
 
     Create-only unless ``--replace``. The project is created if it does not
     exist and the superadmin is added to it, because a project created through
@@ -1174,11 +1214,31 @@ def keyring_push_command(
         )
         return
 
-    placement = keyring_ops.Placement(
+    try:
+        material = (
+            keyring_ops.detect(key_text)
+            if key_type == "auto"
+            else keyring_ops.material_named(key_type)
+        )
+    except keyring_ops.KeyringError as exc:
+        _fail(str(exc))
+        return
+
+    public_text = None
+    if public_file is not None:
+        try:
+            public_text = Path(public_file).read_text()
+        except OSError as exc:
+            _fail(f"cannot read {public_file}: {exc}")
+            return
+
+    placement = keyring_ops.Placement.for_material(
+        material,
         path=install_path,
         owner=install_owner,
         group=install_group,
         mode=install_mode,
+        public_path=install_public_path,
     )
 
     with _client(ctx) as client:
@@ -1197,7 +1257,9 @@ def keyring_push_command(
             organization_id=organization_id,
             operator_email=operator_email,
             project=project,
+            material=material,
             placement=placement,
+            public_override=public_text,
             replace=replace,
             dry_run=dry_run,
         )
@@ -1208,8 +1270,10 @@ def keyring_push_command(
         click.secho(f"  note: {note}", fg="yellow", err=True)
     for problem in summary.errors:
         click.secho(f"  error: {problem}", fg="red", err=True)
-    if summary.recipients:
-        click.echo(f"  recipients: {' '.join(summary.recipients)}")
+    if summary.kinds:
+        click.echo(f"  contains: {', '.join(summary.kinds)}")
+    for line in summary.public:
+        click.echo(f"  public: {line}")
 
     click.secho(
         ("DRY RUN " if dry_run else "") + summary.headline(),
@@ -1265,7 +1329,10 @@ def keyring_audit_command(ctx: click.Context, project: str) -> None:
         sys.exit(EXIT_RUNTIME)
 
     click.echo(f"keyring project {report.project!r} ({report.project_id})")
-    click.echo(f"  entries: {', '.join(report.keys) if report.keys else 'none'}")
+    entries = ", ".join(
+        f"{entry} ({report.key_types.get(entry, 'unknown')})" for entry in report.keys
+    )
+    click.echo(f"  entries: {entries or 'none'}")
     for email, role in sorted(report.users.items()):
         click.echo(f"  user      {email}  {role}")
     for group, role in sorted(report.groups.items()):

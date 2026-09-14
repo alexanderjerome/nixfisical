@@ -1,25 +1,39 @@
-"""Put the estate's age key in Infisical, and get it back onto a host.
+"""Put key material in Infisical, and get it back onto a host.
 
 Everything else in this package treats SOPS as the source of truth and
-Infisical as the view of it. This module is the one deliberate inversion: the
-age key *is* what makes SOPS work, so it cannot come from a SOPS file, and it
-has to reach a freshly-built host somehow. Today that somehow is an operator
-with a USB stick, a scp, or a line in a bootstrap script nobody wants to read.
+Infisical as the view of it. This module is the one deliberate inversion, and
+the age key is why: it *is* what makes SOPS work, so it cannot come from a SOPS
+file, and it has to reach a freshly-built host somehow. Today that somehow is an
+operator with a USB stick, a scp, or a line in a bootstrap script nobody wants
+to read.
+
+SSH keys arrive here by a different road and end up in the same place. Infisical
+had an SSH certificate authority; it was deleted from the product (see the
+migration ``20260729150000_drop-ssh-and-ai-mcp-tables``), and what replaced it
+-- PAM, and the SSH dynamic-secret provider -- is behind a licence. So backing
+up an SSH key is not a certificate operation on a self-hosted instance. It is a
+secret with a placement policy, which is exactly what this already was.
 
 So: one project, holding key material and the policy for placing it, readable
 by the superadmin and by the host identities explicitly granted it.
 
-    keyring/prod/<name>/AGE_SECRET_KEY   the key file, verbatim
-                       /AGE_PUBLIC_KEY   its recipient(s), for `.sops.yaml`
-                       /AGE_KEY_PATH     where it goes on a host
-                       /AGE_KEY_OWNER    who owns it there
-                       /AGE_KEY_GROUP
-                       /AGE_KEY_MODE
+    keyring/prod/<name>/KEY_TYPE         "age" or "ssh"
+                       /PRIVATE_KEY      the key file, verbatim
+                       /PUBLIC_KEY       age recipients, or the ssh public line
+                       /KEY_PATH         where it goes on a host
+                       /KEY_OWNER        who owns it there
+                       /KEY_GROUP
+                       /KEY_MODE
+                       /PUBLIC_KEY_PATH  where the .pub goes (ssh only)
 
 The placement travels with the key on purpose. The alternative is every host
 declaring the path itself, which means the day it moves it moves in seventeen
 places and the sixteen that were updated look identical to the one that was
 not.
+
+What a type changes is narrow and lives in :mod:`nixfisical.material`: how the
+material is validated, how its public half is derived, and what it defaults to
+on disk. Push, audit and install do not branch on it.
 
 **The circularity, which is the thing to get right.** A host needs a credential
 to reach Infisical; that credential normally arrives in a SOPS file; SOPS needs
@@ -47,10 +61,13 @@ mitigated away, because the mitigations available here (an allowlist, a
 signature) either restate the path locally -- defeating the point of centralising
 it -- or need a second root of trust this estate does not have. What *is*
 checked is narrower and worth having: the path must be absolute and free of
-``..``, the value must decode as a real age key, and an existing file at the
-destination that is not itself an age key file is never overwritten. That last
-one is what stops a mistyped or malicious path from turning into a clobbered
-``/etc/shadow``.
+``..``, the value must parse as a real key of the type the entry claims, and an
+existing file at the destination that is not itself a key of that type is never
+overwritten. That last one is what stops a mistyped or malicious path from
+turning into a clobbered ``/etc/shadow``. The one thing the instance does *not*
+get to choose is the mode of the public half; that comes from the type table, so
+a keyring cannot be made to write a world-readable private key by any value it
+holds.
 
 **One keyring project is one blast radius.** Infisical's project roles do not
 scope to a folder without a licensed custom role, so a host granted ``viewer``
@@ -62,23 +79,39 @@ organization boundary this tool already uses for exactly that.
 from __future__ import annotations
 
 import argparse
-import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
 
 from nixfisical.agent import AgentError, SecretSpec, materialise, read_credential
 from nixfisical.api import InfisicalClient, InfisicalError, UniversalAuthCredentials
+from nixfisical.material import (
+    AGE,
+    SSH,
+    TYPES,
+    KeyringError,
+    Material,
+    derive_public,
+    detect,
+    looks_like,
+    parse_private,
+)
+from nixfisical.material import get as material_named
 
 __all__ = [
+    "AGE",
+    "SSH",
+    "TYPES",
     "AuditReport",
     "InstallSummary",
     "KeyringError",
+    "Material",
     "Placement",
     "PushSummary",
     "audit",
+    "detect",
     "install",
+    "material_named",
     "parse_age_key_file",
     "push",
     "main",
@@ -94,19 +127,30 @@ DEFAULT_PROJECT = "keyring"
 # is encrypted to, and there is a key that decrypts nothing.
 ENVIRONMENT = "prod"
 
-KEY_SECRET = "AGE_SECRET_KEY"
-KEY_PUBLIC = "AGE_PUBLIC_KEY"
-KEY_PATH = "AGE_KEY_PATH"
-KEY_OWNER = "AGE_KEY_OWNER"
-KEY_GROUP = "AGE_KEY_GROUP"
-KEY_MODE = "AGE_KEY_MODE"
+# The value names inside one entry's folder. Type-neutral on purpose: an entry
+# is "some key material plus where it goes", and a host reading one should not
+# have to know which kind it is to find the fields.
+KEY_TYPE = "KEY_TYPE"
+KEY_SECRET = "PRIVATE_KEY"
+KEY_PUBLIC = "PUBLIC_KEY"
+KEY_PATH = "KEY_PATH"
+KEY_OWNER = "KEY_OWNER"
+KEY_GROUP = "KEY_GROUP"
+KEY_MODE = "KEY_MODE"
+KEY_PUBLIC_PATH = "PUBLIC_KEY_PATH"
 
-# sops-nix's own default for `sops.age.keyFile`. Matching it means a host that
-# takes the default needs no configuration at all beyond enabling the pull.
-DEFAULT_INSTALL_PATH = "/var/lib/sops-nix/key.txt"
+# The default type when an entry does not name one. Every entry this version
+# writes names one; the fallback is for reading an entry written before
+# `KEY_TYPE` existed, when age was the only thing the keyring held.
+DEFAULT_TYPE = AGE
+
 DEFAULT_OWNER = "root"
 DEFAULT_GROUP = "root"
-DEFAULT_MODE = "0400"
+
+# Kept for callers that predate the type table. Per-type defaults live on the
+# `Material` -- see `nixfisical.material` -- and these two are age's.
+DEFAULT_INSTALL_PATH = AGE.default_path
+DEFAULT_MODE = AGE.default_mode
 
 # The superadmin's role on the keyring project. `admin` rather than `viewer`
 # because the human who owns the estate's key needs to be able to rotate it in
@@ -117,192 +161,18 @@ OPERATOR_ROLE = "admin"
 # reason the push side is a separate credential entirely.
 HOST_ROLE = "viewer"
 
-_SECRET_KEY_PREFIX = "AGE-SECRET-KEY-1"
-_PUBLIC_KEY_COMMENT = "# public key:"
-
-
-class KeyringError(RuntimeError):
-    """A keyring operation that cannot proceed."""
-
-
-# -- bech32 -----------------------------------------------------------------
-#
-# Enough of BIP-173 to answer one question: is this string a structurally valid
-# age secret key, checksum and all? Implemented here rather than shelled out to
-# `age-keygen` because the host side needs the same answer and the host runs
-# the `minimal` build, which deliberately carries no operator tooling. A
-# truncated paste or a byte flipped in transit produces a key that looks right
-# and decrypts nothing, and the place to catch that is before it is written
-# over the working one.
-
-_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
-_GENERATOR = (0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3)
-
-
-def _polymod(values: Iterable[int]) -> int:
-    checksum = 1
-    for value in values:
-        top = checksum >> 25
-        checksum = ((checksum & 0x1FFFFFF) << 5) ^ value
-        for index in range(5):
-            if (top >> index) & 1:
-                checksum ^= _GENERATOR[index]
-    return checksum
-
-
-def _hrp_expand(hrp: str) -> list[int]:
-    return [ord(char) >> 5 for char in hrp] + [0] + [ord(char) & 31 for char in hrp]
-
-
-def _convert_bits(data: Iterable[int]) -> bytes | None:
-    """5-bit groups to 8-bit bytes, rejecting non-canonical padding."""
-    accumulator = 0
-    bits = 0
-    out = bytearray()
-    for value in data:
-        accumulator = (accumulator << 5) | value
-        bits += 5
-        while bits >= 8:
-            bits -= 8
-            out.append((accumulator >> bits) & 0xFF)
-    if bits >= 5 or ((accumulator << (8 - bits)) & 0xFF):
-        return None
-    return bytes(out)
-
-
-def _bech32_decode(token: str, *, expected_hrp: str) -> bytes:
-    """Decode one bech32 string, or raise. Returns the payload bytes."""
-    if any(ord(char) < 33 or ord(char) > 126 for char in token):
-        raise KeyringError("age key contains characters that cannot appear in one")
-    if token.lower() != token and token.upper() != token:
-        # Bech32 is case-insensitive but mixed case is invalid, and a key that
-        # has been through a spreadsheet or a rich-text field arrives that way.
-        raise KeyringError("age key has mixed case, which bech32 does not allow")
-    lowered = token.lower()
-    separator = lowered.rfind("1")
-    if separator < 1:
-        raise KeyringError("age key has no bech32 separator")
-    hrp = lowered[:separator]
-    if hrp != expected_hrp:
-        raise KeyringError(
-            f"age key has the prefix {hrp!r}, expected {expected_hrp!r}"
-        )
-    body = lowered[separator + 1 :]
-    if len(body) < 6:
-        raise KeyringError("age key is too short to carry a checksum")
-    try:
-        values = [_CHARSET.index(char) for char in body]
-    except ValueError as exc:
-        raise KeyringError("age key contains a character outside the bech32 set") from exc
-    if _polymod(_hrp_expand(hrp) + values) != 1:
-        raise KeyringError(
-            "age key fails its bech32 checksum -- it is truncated, mistyped, or "
-            "otherwise not the key it was when it was generated"
-        )
-    payload = _convert_bits(values[:-6])
-    if payload is None:
-        raise KeyringError("age key has invalid bech32 padding")
-    return payload
-
 
 def parse_age_key_file(text: str) -> list[str]:
-    """Return every secret key in an age key file, validating each.
+    """Every secret key in an age key file, validating each.
 
-    An age key file is a sequence of ``AGE-SECRET-KEY-1...`` lines with
-    ``#`` comments between them, and sops-nix is happy with several -- which is
-    how a rekeying is done without a flag day. So the file is taken whole and
-    every key in it is checked, rather than the first one being extracted and
-    the rest silently dropped.
+    A thin name over :func:`nixfisical.material.parse_private` for age, kept
+    because "the list of secret keys in this file" is a question with a natural
+    answer and callers outside the keyring ask it. The generalized form returns
+    a :class:`~nixfisical.material.Parsed`, which separates the printable labels
+    from the raw private tokens; this one hands back the tokens, so its result
+    must not be logged.
     """
-    keys: list[str] = []
-    for number, line in enumerate(text.splitlines(), start=1):
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        if not stripped.upper().startswith(_SECRET_KEY_PREFIX):
-            raise KeyringError(
-                f"line {number} is neither a comment nor an age secret key. "
-                "This does not look like an age key file -- an SSH private key "
-                "and a sops-nix key file are easy to confuse and only one of "
-                "them belongs here."
-            )
-        try:
-            payload = _bech32_decode(stripped, expected_hrp="age-secret-key-")
-        except KeyringError as exc:
-            raise KeyringError(f"line {number}: {exc}") from exc
-        if len(payload) != 32:
-            raise KeyringError(
-                f"line {number}: age secret key decodes to {len(payload)} bytes, "
-                "expected 32"
-            )
-        keys.append(stripped.upper())
-    if not keys:
-        raise KeyringError(
-            "no age secret key in this file. A file holding only 'age1...' "
-            "recipients is the public half; the private half is what a host "
-            "needs to decrypt with."
-        )
-    return keys
-
-
-def _commented_recipients(text: str) -> list[str]:
-    """Recipients from the ``# public key:`` lines age-keygen writes."""
-    found = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.lower().startswith(_PUBLIC_KEY_COMMENT):
-            candidate = stripped[len(_PUBLIC_KEY_COMMENT) :].strip()
-            if candidate.startswith("age1"):
-                found.append(candidate)
-    return found
-
-
-def derive_recipients(text: str) -> tuple[list[str], str | None]:
-    """Recipients for a key file, and a note when they had to be guessed.
-
-    ``age-keygen -y`` is authoritative and reads the key on stdin, so nothing
-    is written to disk to ask it. When it is absent -- a pip install, or the
-    `minimal` build -- the ``# public key:`` comments are used instead, and the
-    note says so, because a comment is an assertion about the file rather than
-    a fact derived from it. When both are available they are compared: a
-    disagreement means the file was hand-edited and the comment now names a
-    recipient nothing in the file can decrypt for.
-    """
-    commented = _commented_recipients(text)
-    try:
-        result = subprocess.run(
-            ["age-keygen", "-y"],
-            input=text,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except (OSError, ValueError):
-        result = None
-
-    if result is None or result.returncode != 0:
-        if commented:
-            return commented, (
-                "recipients read from the file's '# public key:' comments; "
-                "age-keygen is not on PATH to derive them"
-            )
-        return [], (
-            "no recipients recorded: age-keygen is not on PATH and the file "
-            "carries no '# public key:' comment"
-        )
-
-    derived = [
-        line.strip()
-        for line in result.stdout.splitlines()
-        if line.strip().startswith("age1")
-    ]
-    if commented and sorted(commented) != sorted(derived):
-        return derived, (
-            "the file's '# public key:' comments disagree with what its keys "
-            f"actually derive to ({', '.join(commented)} vs "
-            f"{', '.join(derived)}); the derived values are being stored"
-        )
-    return derived, None
+    return list(AGE.parse(text).secrets)
 
 
 # -- placement --------------------------------------------------------------
@@ -316,9 +186,43 @@ class Placement:
     owner: str = DEFAULT_OWNER
     group: str = DEFAULT_GROUP
     mode: str = DEFAULT_MODE
+    #: Where the public half goes, for the types that install one. Empty means
+    #: "beside the private key, with the type's suffix" -- resolved by
+    #: :meth:`for_material`, never left empty in a stored entry.
+    public_path: str = ""
 
-    def validated_path(self) -> Path:
-        """The install path, checked before anything is written to it.
+    @classmethod
+    def for_material(
+        cls,
+        material: Material,
+        *,
+        path: str | None = None,
+        owner: str | None = None,
+        group: str | None = None,
+        mode: str | None = None,
+        public_path: str | None = None,
+    ) -> "Placement":
+        """A placement with this type's defaults filled in for what was omitted.
+
+        The caller passes ``None`` for "you decide", not the age defaults, so
+        that an SSH entry does not silently inherit ``/var/lib/sops-nix/key.txt``
+        and ``0400`` from a dataclass default written when age was the only type.
+        """
+        resolved = path or material.default_path
+        return cls(
+            path=resolved,
+            owner=owner or DEFAULT_OWNER,
+            group=group or DEFAULT_GROUP,
+            mode=mode or material.default_mode,
+            public_path=(
+                (public_path or resolved + material.public_suffix)
+                if material.installs_public
+                else ""
+            ),
+        )
+
+    def _validated(self, raw: str, *, field_name: str) -> Path:
+        """One absolute, non-traversing path, or a refusal naming the field.
 
         These are the checks that hold whoever controls the instance to
         something less than "write any file on the host as root". They do not
@@ -326,23 +230,40 @@ class Placement:
         two accidents that actually happen, a relative path and a traversal,
         into a refusal.
         """
-        raw = self.path.strip()
+        raw = raw.strip()
         if not raw:
-            raise KeyringError(f"{KEY_PATH} is empty")
+            raise KeyringError(f"{field_name} is empty")
         if "\x00" in raw:
-            raise KeyringError(f"{KEY_PATH} contains a NUL byte")
+            raise KeyringError(f"{field_name} contains a NUL byte")
         path = Path(raw)
         if not path.is_absolute():
             raise KeyringError(
-                f"{KEY_PATH} is {raw!r}, which is relative. The host resolves "
+                f"{field_name} is {raw!r}, which is relative. The host resolves "
                 "it as root from whatever directory the unit happened to start "
                 "in, so it must be absolute."
             )
         if ".." in path.parts:
-            raise KeyringError(f"{KEY_PATH} is {raw!r}, which traverses upward")
+            raise KeyringError(f"{field_name} is {raw!r}, which traverses upward")
         return path
 
+    def validated_path(self) -> Path:
+        return self._validated(self.path, field_name=KEY_PATH)
+
+    def validated_public_path(self) -> Path | None:
+        """Where the public half goes, or None when this entry stores none."""
+        if not self.public_path.strip():
+            return None
+        return self._validated(self.public_path, field_name=KEY_PUBLIC_PATH)
+
     def validated_mode(self) -> int:
+        """The private half's mode. Owner-only, for every type there is.
+
+        An SSH key is a credential the same way the estate key is, and OpenSSH
+        refuses a group-readable one anyway, so there is no type that wants this
+        relaxed. The *public* half's mode is not this value and is not stored in
+        the instance at all -- it comes from the type table, so a compromised
+        instance cannot widen it.
+        """
         try:
             mode = int(self.mode, 8)
         except ValueError as exc:
@@ -350,25 +271,32 @@ class Placement:
         if mode & 0o077:
             raise KeyringError(
                 f"{KEY_MODE} is {self.mode}, which is readable beyond its owner. "
-                "This is the key the estate's secrets are encrypted to."
+                "Key material is owner-only, whatever kind it is."
             )
         return mode
 
     def as_secrets(self) -> dict[str, str]:
-        return {
+        values = {
             KEY_PATH: self.path,
             KEY_OWNER: self.owner,
             KEY_GROUP: self.group,
             KEY_MODE: self.mode,
         }
+        if self.public_path:
+            values[KEY_PUBLIC_PATH] = self.public_path
+        return values
 
     @classmethod
-    def from_secrets(cls, values: dict[str, str]) -> "Placement":
-        return cls(
-            path=values.get(KEY_PATH) or DEFAULT_INSTALL_PATH,
-            owner=values.get(KEY_OWNER) or DEFAULT_OWNER,
-            group=values.get(KEY_GROUP) or DEFAULT_GROUP,
-            mode=values.get(KEY_MODE) or DEFAULT_MODE,
+    def from_secrets(
+        cls, values: dict[str, str], material: Material = DEFAULT_TYPE
+    ) -> "Placement":
+        return cls.for_material(
+            material,
+            path=values.get(KEY_PATH),
+            owner=values.get(KEY_OWNER),
+            group=values.get(KEY_GROUP),
+            mode=values.get(KEY_MODE),
+            public_path=values.get(KEY_PUBLIC_PATH),
         )
 
 
@@ -383,7 +311,12 @@ class PushSummary:
     project: str = DEFAULT_PROJECT
     project_id: str = ""
     created_project: bool = False
-    recipients: list[str] = field(default_factory=list)
+    #: The type name stored in ``KEY_TYPE``: ``"age"`` or ``"ssh"``.
+    key_type: str = ""
+    #: What each key in the file is -- ``"age"``, ``"ssh-ed25519"``. Printable.
+    kinds: list[str] = field(default_factory=list)
+    #: The public half as stored: age recipients, or SSH public key lines.
+    public: list[str] = field(default_factory=list)
     replaced: bool = False
     actions: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
@@ -397,8 +330,8 @@ class PushSummary:
         return (
             f"keyring {self.project}/{self.name}: "
             f"project {'created' if self.created_project else 'reused'}, "
-            f"key {'replaced' if self.replaced else 'stored'}, "
-            f"recipients {len(self.recipients)}, errors {len(self.errors)}"
+            f"{self.key_type or 'key'} {'replaced' if self.replaced else 'stored'}, "
+            f"public {len(self.public)}, errors {len(self.errors)}"
         )
 
 
@@ -412,6 +345,8 @@ class AuditReport:
     groups: dict[str, str] = field(default_factory=dict)
     identities: dict[str, str] = field(default_factory=dict)
     keys: list[str] = field(default_factory=list)
+    #: Entry name to the type it holds, for the entries that record one.
+    key_types: dict[str, str] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
@@ -426,9 +361,14 @@ class InstallSummary:
 
     name: str = ""
     path: str = ""
+    key_type: str = ""
     written: bool = False
     unchanged: bool = False
-    recipients: list[str] = field(default_factory=list)
+    #: Where the public half was installed, when the type has one.
+    public_path: str = ""
+    public_written: bool = False
+    #: The public half as the instance holds it. Printable.
+    public: list[str] = field(default_factory=list)
     keys_in_file: int = 0
     actions: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
@@ -441,10 +381,10 @@ class InstallSummary:
         if not self.ok:
             return f"keyring {self.name}: failed"
         state = "written" if self.written else "unchanged"
+        public = ", ".join(self.public) if self.public else "unrecorded"
         return (
-            f"keyring {self.name}: {state} at {self.path}, "
-            f"{self.keys_in_file} key(s), recipients "
-            f"{', '.join(self.recipients) if self.recipients else 'unrecorded'}"
+            f"keyring {self.name} ({self.key_type or 'unknown type'}): {state} at "
+            f"{self.path}, {self.keys_in_file} key(s), public {public}"
         )
 
 
@@ -482,27 +422,42 @@ def push(
     organization_id: str,
     operator_email: str | None,
     project: str = DEFAULT_PROJECT,
+    material: Material | None = None,
     placement: Placement | None = None,
+    public_override: str | None = None,
     replace: bool = False,
     dry_run: bool = False,
 ) -> PushSummary:
-    """Store an age key and its placement policy under ``name``.
+    """Store a key and its placement policy under ``name``.
+
+    ``material`` is the kind of key; ``None`` means sniff it from the file, which
+    is what the CLI does unless ``--type`` says otherwise.
 
     Create-only by default. Overwriting the key a fleet is already encrypted to
     is the single most destructive thing in this package: every host that pulls
     afterwards gets an identity that decrypts nothing, and it fails at the next
     activation rather than now, which is a failure separated from its cause by
     however long that takes. ``replace=True`` is the operator saying they meant
-    it, and the summary names both recipients so the change is visible.
+    it, and the summary names both public halves so the change is visible.
     """
-    placement = placement or Placement()
     summary = PushSummary(name=name, project=project)
 
     try:
-        keys = parse_age_key_file(key_text)
+        material = material or detect(key_text)
     except KeyringError as exc:
         summary.errors.append(str(exc))
         return summary
+    summary.key_type = material.name
+
+    placement = placement or Placement.for_material(material)
+
+    try:
+        parsed = parse_private(material, key_text)
+    except KeyringError as exc:
+        summary.errors.append(str(exc))
+        return summary
+    summary.kinds = list(parsed.kinds)
+    keys = parsed.kinds
 
     # Validated before anything is created, not at install time. A path the
     # host will refuse is a keyring entry that looks stored and is not usable,
@@ -510,14 +465,23 @@ def push(
     try:
         placement.validated_path()
         placement.validated_mode()
+        placement.validated_public_path()
     except KeyringError as exc:
         summary.errors.append(str(exc))
         return summary
 
-    recipients, note = derive_recipients(key_text)
-    summary.recipients = recipients
-    if note:
-        summary.notes.append(note)
+    if public_override is not None:
+        # The sidecar `.pub`, when the operator passed one. It is preferred over
+        # the derived line for one reason: it carries the comment, which is what
+        # makes an `authorized_keys` entry identifiable a year later. It is also
+        # the only source for a PEM key, whose public half cannot be derived.
+        public = [line.strip() for line in public_override.splitlines() if line.strip()]
+        summary.notes.append("public half taken from the file given, not derived")
+    else:
+        public, note = derive_public(material, key_text)
+        if note:
+            summary.notes.append(note)
+    summary.public = public
 
     try:
         project_ids = client.list_projects(organization_id)
@@ -571,18 +535,33 @@ def push(
     if existing.get(KEY_SECRET) and not replace:
         previous = existing.get(KEY_PUBLIC) or "unrecorded"
         summary.errors.append(
-            f"{project}/{ENVIRONMENT}{_folder(name)} already holds a key "
-            f"(recipients: {previous}). Refusing to overwrite it: every host "
-            "that has pulled it decrypts with it, and a replacement fails at "
-            "their next activation rather than here. Pass --replace if this is "
-            "a rotation you have planned the re-encryption for."
+            f"{project}/{ENVIRONMENT}{_folder(name)} already holds a "
+            f"{existing.get(KEY_TYPE) or 'key'} (public: {previous}). Refusing to "
+            "overwrite it: every host that has pulled it is using it, and a "
+            "replacement fails at their next activation rather than here. Pass "
+            "--replace if this is a rotation you have planned for."
         )
         return summary
     summary.replaced = bool(existing.get(KEY_SECRET))
 
-    payload = {KEY_SECRET: key_text, **placement.as_secrets()}
-    if recipients:
-        payload[KEY_PUBLIC] = " ".join(recipients)
+    was = existing.get(KEY_TYPE)
+    if was and was != material.name:
+        # Allowed -- an entry is a name, not a type -- but it changes what every
+        # host that pulls this name installs, and the placement changed with it.
+        summary.notes.append(
+            f"entry {name!r} held a {was} key and now holds a {material.name} one; "
+            "any host pulling it will install the new kind at the new path"
+        )
+
+    payload = {
+        KEY_TYPE: material.name,
+        KEY_SECRET: key_text,
+        **placement.as_secrets(),
+    }
+    if public:
+        # Newline-separated, not space-separated: an SSH public key line has
+        # spaces in it, so a space join would be unsplittable on the way back.
+        payload[KEY_PUBLIC] = "\n".join(public)
 
     for key, value in payload.items():
         try:
@@ -679,14 +658,22 @@ def audit(
             report.errors.append(f"list project {label}: {exc}")
 
     try:
-        folders = {
-            "/" + str(entry.get("secretPath") or "/").strip("/")
-            for entry in client.list_secrets(
-                project_id=project_id, environment=ENVIRONMENT, path="/"
-            )
-            if entry.get("secretKey") == KEY_SECRET
+        folders: set[str] = set()
+        types: dict[str, str] = {}
+        for entry in client.list_secrets(
+            project_id=project_id, environment=ENVIRONMENT, path="/"
+        ):
+            folder = ("/" + str(entry.get("secretPath") or "/").strip("/")).strip("/")
+            if not folder:
+                continue
+            if entry.get("secretKey") == KEY_SECRET:
+                folders.add(folder)
+            elif entry.get("secretKey") == KEY_TYPE:
+                types[folder] = str(entry.get("secretValue") or "")
+        report.keys = sorted(folders)
+        report.key_types = {
+            folder: types.get(folder, DEFAULT_TYPE.name) for folder in report.keys
         }
-        report.keys = sorted(folder.strip("/") for folder in folders if folder != "/")
     except InfisicalError as exc:
         report.errors.append(f"list keyring entries: {exc}")
 
@@ -713,14 +700,24 @@ def audit(
 # -- the host half ----------------------------------------------------------
 
 
-def _refuse_to_clobber(destination: Path) -> None:
-    """Never overwrite a file at ``destination`` that is not an age key file.
+def _refuse_to_clobber(
+    destination: Path,
+    *,
+    recognise,
+    what: str,
+    field_name: str,
+) -> None:
+    """Never overwrite a file at ``destination`` that ``recognise`` rejects.
 
     The path came from the instance. This is the check that keeps a wrong one
     from being destructive rather than merely wrong: if something is already
     there and it does not look like what we are about to write, we stop. A
     keyring pointed at ``/etc/shadow`` then fails loudly on a host that still
     has its ``/etc/shadow``.
+
+    ``recognise`` is deliberately the *shape* test, not an equality test against
+    what we fetched -- overwriting one age key with another is the rotation this
+    command exists for, and refusing that would refuse the point.
     """
     if not destination.exists():
         return
@@ -731,14 +728,18 @@ def _refuse_to_clobber(destination: Path) -> None:
     except (OSError, UnicodeDecodeError) as exc:
         raise KeyringError(
             f"{destination} already exists and cannot be read as text ({exc}), "
-            "so it cannot be confirmed to be an age key file. Refusing to "
-            "overwrite it."
+            f"so it cannot be confirmed to be {what}. Refusing to overwrite it."
         ) from exc
-    if _SECRET_KEY_PREFIX not in current.upper():
+    if not current.strip():
+        # A zero-byte file destroys nothing and is the normal leftover of a
+        # half-finished write. Refusing it would make the common case the loud
+        # one.
+        return
+    if not recognise(current):
         raise KeyringError(
-            f"{destination} already exists and holds no age secret key. "
-            f"Refusing to overwrite it: {KEY_PATH} in the instance points at a "
-            "file this host is using for something else."
+            f"{destination} already exists and is not {what}. Refusing to "
+            f"overwrite it: {field_name} in the instance points at a file this "
+            "host is using for something else."
         )
 
 
@@ -789,21 +790,33 @@ def install(
         )
         return summary
 
-    # Validated on arrival, before the placement is even resolved. What is
-    # about to be overwritten is the only thing that can read this host's
-    # secrets, and a value that is not an age key can only make that worse.
+    # The type comes from the instance too, so it is resolved before anything
+    # else -- it decides how the material is validated, and validating an SSH
+    # key as an age one would reject it for the wrong reason.
     try:
-        keys = parse_age_key_file(key_text)
+        material = material_named(values[KEY_TYPE]) if values.get(KEY_TYPE) else DEFAULT_TYPE
+    except KeyringError as exc:
+        summary.errors.append(f"{KEY_TYPE} from the instance is not usable: {exc}")
+        return summary
+    summary.key_type = material.name
+
+    # Validated on arrival, before the placement is even resolved. What is about
+    # to be overwritten is a working credential, and a value that is not a key
+    # of this type can only make that worse.
+    try:
+        parsed = parse_private(material, key_text)
     except KeyringError as exc:
         summary.errors.append(f"{KEY_SECRET} from the instance is not usable: {exc}")
         return summary
-    summary.keys_in_file = len(keys)
-    stored_recipients = (values.get(KEY_PUBLIC) or "").split()
-    summary.recipients = [item for item in stored_recipients if item.startswith("age1")]
+    summary.keys_in_file = len(parsed)
+    summary.public = [
+        line.strip() for line in (values.get(KEY_PUBLIC) or "").splitlines() if line.strip()
+    ]
 
-    placement = Placement.from_secrets(values)
+    placement = Placement.from_secrets(values, material)
     if path_override:
-        placement = Placement(
+        placement = Placement.for_material(
+            material,
             path=path_override,
             owner=placement.owner,
             group=placement.group,
@@ -811,51 +824,101 @@ def install(
         )
         summary.actions.append(
             f"path overridden locally to {path_override} (instance says "
-            f"{values.get(KEY_PATH) or DEFAULT_INSTALL_PATH})"
+            f"{values.get(KEY_PATH) or material.default_path}); the public half, "
+            "if any, follows it"
         )
 
     try:
         destination = placement.validated_path()
         placement.validated_mode()
+        public_destination = placement.validated_public_path()
     except KeyringError as exc:
         summary.errors.append(str(exc))
         return summary
     summary.path = str(destination)
 
+    public_text = ""
+    if material.installs_public and public_destination is not None:
+        if not summary.public:
+            # Not fatal for age (there is nothing to install) but for SSH it
+            # means the entry was pushed without a derivable public half, and a
+            # private key with no `.pub` beside it breaks `ssh -i`.
+            summary.actions.append(
+                f"no {KEY_PUBLIC} stored for this entry, so nothing is written to "
+                f"{public_destination}; push it again with --public-from-file"
+            )
+            public_destination = None
+        else:
+            public_text = "\n".join(summary.public) + "\n"
+    else:
+        public_destination = None
+    summary.public_path = str(public_destination) if public_destination else ""
+
     try:
-        _refuse_to_clobber(destination)
+        _refuse_to_clobber(
+            destination,
+            recognise=lambda text: looks_like(material, text),
+            what=f"an {material.label}" if material.name == "age" else f"a {material.label}",
+            field_name=KEY_PATH,
+        )
+        if public_destination is not None:
+            _refuse_to_clobber(
+                public_destination,
+                recognise=material.public_matches,
+                what=f"a {material.name} public key",
+                field_name=KEY_PUBLIC_PATH,
+            )
     except KeyringError as exc:
         summary.errors.append(str(exc))
         return summary
 
     if dry_run:
         summary.actions.append(
-            f"would write {len(keys)} key(s) to {destination} as "
+            f"would write {len(parsed)} {material.name} key(s) to {destination} as "
             f"{placement.owner}:{placement.group} {placement.mode}"
         )
+        if public_destination is not None:
+            summary.actions.append(
+                f"would write the public half to {public_destination} as "
+                f"{placement.owner}:{placement.group} {material.public_mode}"
+            )
         return summary
 
     # materialise() is the agent's: atomic rename, ownership and mode set
     # before the file is visible at its final name. The reader here is sops-nix
     # at activation, which is exactly the "opens it mid-run" case that
     # write-then-chmod would lose to.
-    spec = SecretSpec(
-        project=project,
-        environment=ENVIRONMENT,
-        folder=_folder(name),
-        name=KEY_SECRET,
-        path=destination,
-        owner=placement.owner,
-        group=placement.group,
-        mode=placement.mode,
-    )
+    def _spec(path: Path, value_name: str, mode: str) -> SecretSpec:
+        return SecretSpec(
+            project=project,
+            environment=ENVIRONMENT,
+            folder=_folder(name),
+            name=value_name,
+            path=path,
+            owner=placement.owner,
+            group=placement.group,
+            mode=mode,
+        )
+
     try:
-        changed = materialise(spec, key_text)
+        changed = materialise(_spec(destination, KEY_SECRET, placement.mode), key_text)
     except AgentError as exc:
         summary.errors.append(str(exc))
         return summary
     summary.written = changed
     summary.unchanged = not changed
+
+    if public_destination is not None:
+        # The public half's mode is the type's, not the instance's -- see
+        # `Placement.validated_mode`. Written after the private key so a reader
+        # racing us never sees a `.pub` for a key that is not there yet.
+        try:
+            summary.public_written = materialise(
+                _spec(public_destination, KEY_PUBLIC, material.public_mode),
+                public_text,
+            )
+        except AgentError as exc:
+            summary.errors.append(f"write {public_destination}: {exc}")
     return summary
 
 
@@ -871,7 +934,8 @@ def main(argv: list[str] | None = None) -> int:
     """
     parser = argparse.ArgumentParser(
         prog="nixfisical-keyring-install",
-        description="Fetch this host's age key from Infisical and install it.",
+        description="Fetch a key from the Infisical keyring and install it. The "
+        "kind of key, and where it goes, come from the entry.",
     )
     parser.add_argument("--name", required=True, help="keyring entry to install")
     parser.add_argument("--url", required=True, help="base URL of the instance")
