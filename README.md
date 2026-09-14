@@ -239,11 +239,13 @@ updated, and **deleted**. Run it first.
 | `lib.manifestOf` | `nixosConfigurations` → manifest list. |
 | `lib.manifestFrom` | `{ nixosConfigurations, extraSecrets }` → manifest list. |
 | `lib.assertManifest` | Fail evaluation on a malformed manifest. |
+| `lib.mkDotenvTemplate` | A Go template dumping one Infisical folder as dotenv. |
 | `mkManifestApp` | Wrap a manifest as a `nix run .#infisical-manifest` app. |
 | `nixosModules.export` | Adds `sops.secrets.<key>.infisical`. |
 | `nixosModules.server` | Runs a self-hosted instance. |
 | `nixosModules.default` | Both of the above. |
 | `nixosModules.inject` | Fetches this host's secrets from Infisical at boot. Experimental; **not** in `default`. |
+| `homeManagerModules.agent` | Upstream's Infisical agent as a `systemd.user` service, rendering templates into a developer's tree. |
 | `packages.nixfisical` | The `nixfisical` CLI. |
 | `packages.nixfisical-agent` | The host halves — `nixfisical-agent` and `nixfisical-keyring-install` — without the CLI or its closure. |
 | `packages.infisical-backend` | The Infisical API, built from source. No web UI. |
@@ -1010,9 +1012,150 @@ There is deliberately no `--expect-recipient`. Checking the fetched
 who can change one can change the other; it would read like a guarantee and be
 theatre.
 
+## The developer agent
+
+The two paths above are for machines an operator owns. This one is for the
+laptop, and it is a different problem: nothing there reboots on a schedule, and
+a `.env` file that quietly went stale is a developer running yesterday's
+credentials against today's instance and filing a bug about it.
+
+So `homeManagerModules.agent` is a daemon. It wraps **upstream's** Go binary
+(`pkgs.infisical`), which has a template engine this repo does not reimplement,
+and runs it as a `systemd.user` service that polls and re-renders.
+
+```nix
+programs.nixfisical.agent = {
+  enable = true;
+  address = "https://infisical.example.com";
+  auth = {
+    clientIdFile = "${config.home.homeDirectory}/.config/infisical/client-id";
+    clientSecretFile = "${config.home.homeDirectory}/.config/infisical/client-secret";
+  };
+
+  projects.work = {
+    projectId = "3a1e0c2e-1f4b-4f5e-9f1d-2b7c8e5a9d10";
+    environment = "dev";
+
+    templates.api = {
+      dotenv.enable = true;
+      dotenv.secretPath = "/backend";
+      destination = "${config.home.homeDirectory}/src/api/.env";
+      onChange = "systemctl --user try-restart api-dev.service";
+    };
+
+    templates.nginx = {
+      source = ./templates/dev-nginx.conf.tmpl;
+      destination = "${config.home.homeDirectory}/.config/dev-nginx.conf";
+      mode = "0644";
+    };
+  };
+};
+```
+
+**Home-manager only, deliberately.** A polling daemon is the right answer on a
+laptop and the wrong one on a server, where a secret changing under a running
+process should be a restart the operator ordered. There is no NixOS counterpart
+and adding one would be a mistake — that machine wants `nixosModules.inject`.
+
+**Projects are the grouping because that is what makes a template short.** A
+`dotenv` template inherits its project's `projectId` and `environment` instead
+of repeating them, so a second folder from the same project is three lines.
+
+### Templates
+
+A template is a Go `text/template`, evaluated by the agent against the live
+instance. It contains coordinates, not values — which is why it is safe in the
+Nix store, and why the rendered output is the only place a secret appears.
+
+Three ways to supply one, and exactly one per template:
+
+- `source = ./foo.tmpl` — a real file. Reach for this. A template that does
+  anything beyond a flat dump has conditionals in it, and those belong under
+  version control rather than in a Nix string.
+- `content = "..."` — inline, for the small cases.
+- `dotenv.enable = true` — the flat dump, generated for you.
+
+The last is `lib.mkDotenvTemplate`, which is also exported on its own:
+
+```nix
+content = nixfisical.lib.mkDotenvTemplate {
+  projectId = "3a1e0c2e-…";
+  environment = "dev";
+  secretPath = "/backend";
+};
+```
+
+It is exported precisely because the escape hatch is a file you write, and the
+dotenv case should not be the one thing you cannot start from. Emit it, read
+it, edit it into whatever your project actually needs.
+
+All three reach the agent as `source-path` — inline content is written to the
+store and the path handed over. A Go template is whitespace-significant (a
+dotenv file's trailing newline decides whether some parsers see the last pair),
+and a YAML block scalar is the wrong place to argue about trailing whitespace.
+It also means both forms are one code path, so a bug in either is a bug in
+both.
+
+### What this module fixes about the agent
+
+Three upstream behaviours the module handles, because each is silent when it
+goes wrong:
+
+**Modes.** Upstream writes rendered output with a bare `os.Create`, which
+leaves a new file at 0644 minus the umask — on a shared machine, every
+credential the developer has, readable by everyone. The module creates each
+destination first, inside a `umask 077` subshell so there is no window at 0644,
+then chmods it to the declared `mode` (0600 by default). `os.Create` truncates
+an existing file without touching its mode, so that holds for every later
+render. Parent directories are created with `mkdir -p`, not `install -d -m`,
+because the parent of a destination is usually a source tree the developer
+already owns and `install -d` would chmod it.
+
+**`execute`, not `exec`.** The `onChange` hook's YAML key is `execute`.
+Upstream's own documented example says `exec`, which does not match the struct
+tag, so it unmarshals to nothing and the command silently never runs. The
+`hm-agent` flake check pins the spelling.
+
+**`$SHELL`.** The agent runs `onChange` through `$SHELL` when one is set,
+falling back to `sh` — so the same string would be interpreted by bash on one
+machine and fish on another. The unit pins `SHELL`, and `onChange` means one
+thing.
+
+Two upstream behaviours it does **not** paper over, because hiding them would
+only move the surprise:
+
+- `onChange` does not fire on the first render. A service that needs the file
+  to exist should be ordered after this unit, not hung off the hook.
+- Every template polls on its own timer, so N templates against one project is
+  N times the request rate.
+
+### Credentials
+
+`clientIdFile` and `clientSecretFile` are `types.str`, not `types.path`, and
+that is the point: a `types.path` would copy the file into the Nix store, which
+for the client secret means publishing a credential to every user on the
+machine. Both options are the same type so that mistake is not one character
+away.
+
+The files themselves are delivered by whatever the developer already trusts.
+This module will not place them, because placing them would mean putting them
+in the store.
+
+The agent reads `INFISICAL_UNIVERSAL_AUTH_CLIENT_ID` from the environment in
+preference to the file, so an exported variable silently wins over the
+configuration.
+
 ## What it does not do yet
 
 **Folder pruning.** Secrets are pruned; empty folders are left behind.
+
+**The developer agent has not run against a live instance.** The generated
+config is checked structurally — every key in it is a Go struct tag, and a
+wrong one does not fail, it unmarshals to the zero value and the agent runs
+happily doing slightly less than you asked. The `hm-agent` check parses the
+output with the same YAML library the agent uses and asserts the tags, the
+template function call, and the modifier keys. That is not the same as having
+watched it authenticate.
 
 **Direct injection is unproven.** It evaluates, its Python is covered, and the
 generated spec round-trips through the real agent binary — but nothing has run
